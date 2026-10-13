@@ -492,11 +492,19 @@ func (s *newSession) round(w http.ResponseWriter, r *http.Request) roundResult {
 		s.caps.setVersion(s.version)
 		metricAttempts.WithLabelValues(host).Inc()
 		noteAttempt(host)
-		resp, status := session(r.Context(), h, r.Header, s.caps)
+		ctx, cancel := attemptContext(r.Context())
+		resp, status := session(ctx, h, r.Header, s.caps)
+		cancel()
 		if r.Context().Err() != nil {
 			breakerRelease(host)
 			s.finish(resultCanceled)
-			s.log("CLIENT_DISCONNECTED", host, "", true, "")
+			sess, ok := sessionIDOf(resp)
+			if status == browserStarted && ok {
+				s.log("CLIENT_DISCONNECTED", host, sess, true, "session created after the client went away")
+				s.deleteOrphan(h, sess)
+			} else {
+				s.log("CLIENT_DISCONNECTED", host, "", true, "")
+			}
 			return roundDone
 		}
 		reason := ""
@@ -556,18 +564,17 @@ func (s *newSession) round(w http.ResponseWriter, r *http.Request) roundResult {
 
 // created replies with the session ID prefixed by the host hash.
 func (s *newSession) created(w http.ResponseWriter, r *http.Request, h *config.Host, resp map[string]interface{}) {
-	sess, ok := resp["sessionId"].(string)
-	if ok {
+	sess, ok := sessionIDOf(resp)
+	if !ok {
+		reply(w, errMsg("protocol error"), http.StatusBadGateway)
+		s.finish(resultBadResponse)
+		s.log("BAD_RESPONSE", h.Net(), "", false, "")
+		return
+	}
+	if _, ok := resp["sessionId"].(string); ok {
 		resp["sessionId"] = h.Sum() + sess
 	} else {
-		valueMap, _ := resp["value"].(map[string]interface{})
-		sess, ok = valueMap["sessionId"].(string)
-		if !ok {
-			reply(w, errMsg("protocol error"), http.StatusBadGateway)
-			s.finish(resultBadResponse)
-			s.log("BAD_RESPONSE", h.Net(), "", false, "")
-			return
-		}
+		valueMap := resp["value"].(map[string]interface{})
 		valueMap["sessionId"] = h.Sum() + sess
 		rewriteCDP(r, valueMap, h.Sum()+sess)
 	}

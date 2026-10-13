@@ -64,4 +64,9 @@ var (
 		Name: "ggr_host_free_slots",
 		Help: "Free slots of a host from its last /status (total - used - pending).",
 	}, []string{"host"})
+
+	metricOrphansDeleted = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "ggr_orphan_sessions_deleted_total",
+		Help: "Sessions deleted because the client went away before receiving them, by result (ok, error).",
+	}, []string{"result"})
 )

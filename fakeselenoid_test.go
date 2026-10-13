@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -52,6 +53,8 @@ func jsonError(w http.ResponseWriter, code int, err, msg string) {
 }
 
 func (f *fakeSelenoid) create(w http.ResponseWriter, r *http.Request) {
+	// Reading the body lets net/http notice when Ggr drops the connection.
+	_, _ = io.Copy(io.Discard, r.Body)
 	_, noWait := r.Header["X-Selenoid-No-Wait"]
 	f.mu.Lock()
 	f.attempts++
