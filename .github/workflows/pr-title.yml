@@ -1,0 +1,23 @@
+name: pr-title
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+permissions: {}
+
+jobs:
+  conventional-commits:
+    runs-on: ubuntu-latest
+    steps:
+      # Squash merges use the PR title as the commit message, and release-please
+      # derives the next version from it.
+      - name: Check PR title follows Conventional Commits
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          pattern='^(feat|fix|perf|revert|build|ci|docs|test|refactor|style|chore)(\([a-z0-9._/-]+\))?!?: .+'
+          if ! printf '%s' "$TITLE" | grep -Eq "$pattern"; then
+            echo "::error::PR title must follow Conventional Commits, e.g. 'fix: ...', 'feat(status): ...' or 'feat!: ...'. Got: $TITLE"
+            exit 1
+          fi
