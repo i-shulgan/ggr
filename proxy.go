@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"encoding/xml"
 	"fmt"
@@ -36,6 +37,7 @@ const (
 	defaultVNCPort = "5900"
 	vncScheme      = "vnc"
 	wsScheme       = "ws"
+	wssScheme      = "wss"
 )
 
 var paths = struct {
@@ -202,9 +204,7 @@ func session(ctx context.Context, h *config.Host, header http.Header, c caps) (m
 		}
 	}
 	req.Header.Del("Accept-Encoding")
-	if h.Username != "" && h.Password != "" {
-		req.SetBasicAuth(h.Username, h.Password)
-	}
+	setHostAuth(req.Header, h)
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	req = req.WithContext(ctx)
@@ -232,6 +232,15 @@ func session(ctx context.Context, h *config.Host, header http.Header, c caps) (m
 		return reply, browserFailed
 	}
 	return reply, browserStarted
+}
+
+// setHostAuth replaces the client credentials with the ones from quota when
+// the host has them.
+func setHostAuth(header http.Header, h *config.Host) {
+	if h.Username != "" && h.Password != "" {
+		auth := base64.StdEncoding.EncodeToString([]byte(h.Username + ":" + h.Password))
+		header.Set("Authorization", "Basic "+auth)
+	}
 }
 
 func reply(w http.ResponseWriter, msg map[string]interface{}, status int) {
@@ -439,6 +448,7 @@ func proxy(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			setForwardedFor(pr)
+			setHostAuth(out.Header, h)
 			out.URL.Scheme = "http"
 			if h.Scheme != "" {
 				out.URL.Scheme = h.Scheme
@@ -616,7 +626,7 @@ func createVNCInfo(h config.Host) *config.VncInfo {
 			log.Printf("[-] [-] [INVALID_HOST_VNC_URL] [-] [-] [%s] [%s] [-] [-] [-]\n", vncURL, fmt.Sprintf("%s:%d", h.Name, h.Port))
 			return nil
 		}
-		if u.Scheme != vncScheme && u.Scheme != wsScheme {
+		if u.Scheme != vncScheme && u.Scheme != wsScheme && u.Scheme != wssScheme {
 			log.Printf("[-] [-] [UNSUPPORTED_HOST_VNC_SCHEME] [-] [-] [%s] [%s] [-] [-] [-]\n", vncURL, fmt.Sprintf("%s:%d", h.Name, h.Port))
 			return nil
 		}
@@ -624,8 +634,10 @@ func createVNCInfo(h config.Host) *config.VncInfo {
 			Scheme: u.Scheme,
 			Path:   u.Path,
 		}
-		vncInfo.Scheme = u.Scheme
-		vncInfo.Host, vncInfo.Port, _ = net.SplitHostPort(u.Host)
+		vncInfo.Host, vncInfo.Port = u.Hostname(), u.Port()
+		if vncInfo.Port == "" {
+			vncInfo.Port = map[string]string{vncScheme: defaultVNCPort, wsScheme: "80", wssScheme: "443"}[u.Scheme]
+		}
 		return &vncInfo
 	}
 	return nil
@@ -705,8 +717,8 @@ func vnc(wsconn *websocket.Conn) {
 		switch scheme {
 		case vncScheme:
 			proxyVNC(id, wsconn, sessionID, host, port)
-		case wsScheme:
-			proxyWebSockets(id, wsconn, sessionID, host, port, path)
+		case wsScheme, wssScheme:
+			proxyWebSockets(id, wsconn, h, sessionID, scheme, host, port, path)
 		default:
 			{
 				log.Printf("[%d] [-] [UNSUPPORTED_HOST_VNC_SCHEME] [-] [-] [%s] [-] [-] [-] [-]\n", id, scheme)
@@ -726,11 +738,16 @@ func proxyVNC(id uint64, wsconn *websocket.Conn, sessionID string, host string, 
 	proxyConn(id, wsconn, conn, err, sessionID, address)
 }
 
-func proxyWebSockets(id uint64, wsconn *websocket.Conn, sessionID string, host string, port string, path string) {
+func proxyWebSockets(id uint64, wsconn *websocket.Conn, h *config.Host, sessionID string, scheme string, host string, port string, path string) {
 	origin := "http://localhost/"
-	u := fmt.Sprintf("ws://%s:%s%s/%s", host, port, path, sessionID)
-	//TODO: consider context from wsconn
-	conn, err := websocket.Dial(u, "", origin)
+	u := fmt.Sprintf("%s://%s%s/%s", scheme, net.JoinHostPort(host, port), path, sessionID)
+	cfg, err := websocket.NewConfig(u, origin)
+	if err != nil {
+		proxyConn(id, wsconn, nil, err, sessionID, u)
+		return
+	}
+	setHostAuth(cfg.Header, h)
+	conn, err := cfg.DialContext(wsconn.Request().Context())
 	proxyConn(id, wsconn, conn, err, sessionID, u)
 }
 
@@ -801,6 +818,7 @@ func proxyStatic(w http.ResponseWriter, r *http.Request, route string, invalidUr
 		(&httputil.ReverseProxy{
 			Rewrite: func(pr *httputil.ProxyRequest) {
 				setForwardedFor(pr)
+				setHostAuth(pr.Out.Header, h)
 				out := pr.Out
 				out.URL.Scheme = "http"
 				if h.Scheme != "" {
