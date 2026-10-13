@@ -26,11 +26,6 @@ import (
 	"path/filepath"
 )
 
-var _ = func() bool {
-	testing.Init()
-	return true
-}()
-
 var (
 	srv  *httptest.Server
 	test sync.Mutex
