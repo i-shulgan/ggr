@@ -581,21 +581,6 @@ func postOnly(handler http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-func withCloseNotifier(handler http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		ctx, cancel := context.WithCancel(r.Context())
-		go func() {
-			handler(w, r.WithContext(ctx))
-			cancel()
-		}()
-		select {
-		case <-r.Context().Done():
-			cancel()
-		case <-ctx.Done():
-		}
-	}
-}
-
 func readConfig(fn string, browsers *config.Browsers) error {
 	file, err := os.ReadFile(fn)
 	if err != nil {
@@ -853,7 +838,7 @@ func mux() http.Handler {
 	mux.HandleFunc(paths.Err, err)
 	mux.HandleFunc(paths.Host, WithSuitableAuthentication(authenticator, host))
 	mux.HandleFunc(paths.Quota, WithSuitableAuthentication(authenticator, quotaInfo))
-	mux.HandleFunc(paths.Route, withCloseNotifier(WithSuitableAuthentication(authenticator, postOnly(route))))
+	mux.HandleFunc(paths.Route, WithSuitableAuthentication(authenticator, postOnly(route)))
 	mux.HandleFunc(paths.Proxy, proxy)
 	mux.Handle(paths.VNC, websocket.Handler(vnc))
 	mux.HandleFunc(paths.Video, WithSuitableAuthentication(authenticator, video))
