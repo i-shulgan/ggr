@@ -496,7 +496,12 @@ func (s *newSession) round(w http.ResponseWriter, r *http.Request) roundResult {
 		resp, status := session(ctx, h, r.Header, s.caps)
 		cancel()
 		if r.Context().Err() != nil {
-			breakerRelease(host)
+			if status == seleniumError {
+				// Possibly aborted by us after orphanGrace: says nothing.
+				breakerRelease(host)
+			} else {
+				breakerSuccess(host)
+			}
 			s.finish(resultCanceled)
 			sess, ok := sessionIDOf(resp)
 			if status == browserStarted && ok {
