@@ -13,7 +13,7 @@ import (
 	"syscall"
 	"time"
 
-	. "github.com/aerokube/ggr/config"
+	"github.com/aerokube/ggr/config"
 )
 
 var (
@@ -57,7 +57,7 @@ func loadQuotaFiles(quotaDir string) error {
 func loadQuotaFile(file string) {
 	fileName := filepath.Base(file)
 	quotaName := strings.TrimSuffix(fileName, filepath.Ext(fileName))
-	var browsers Browsers
+	var browsers config.Browsers
 	err := readConfig(file, &browsers)
 	if err != nil {
 		log.Printf("[-] [-] [INIT] [-] [-] [-] [-] [-] [-] [Failed to load configuration from \"%s\": %v]\n", fileName, err)
@@ -69,7 +69,7 @@ func loadQuotaFile(file string) {
 	}
 }
 
-func updateQuota(quotaName string, browsers Browsers) {
+func updateQuota(quotaName string, browsers config.Browsers) {
 	confLock.Lock()
 	defer confLock.Unlock()
 	quota[quotaName] = ggrBrowsers{browsers}
