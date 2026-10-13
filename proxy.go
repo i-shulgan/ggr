@@ -538,24 +538,37 @@ func quotaInfo(w http.ResponseWriter, r *http.Request) {
 	user, remote := info(r)
 	log.Printf("[%d] [-] [QUOTA_INFO_REQUESTED] [%s] [%s] [-] [-] [-] [-] [-]\n", id, user, remote)
 	confLock.RLock()
-	browsers := quota[user]
+	browsers := withoutCredentials(quota[user].Browsers.Browsers)
 	confLock.RUnlock()
 	w.Header().Set("Content-Type", "application/json")
-	for i := 0; i < len(browsers.Browsers.Browsers); i++ {
-		browser := &browsers.Browsers.Browsers[i]
-		for j := 0; j < len(browser.Versions); j++ {
-			version := &browser.Versions[j]
-			for k := 0; k < len(version.Regions); k++ {
-				region := &version.Regions[k]
-				for l := 0; l < len(region.Hosts); l++ {
-					host := &region.Hosts[l]
-					host.Username = ""
-					host.Password = ""
-				}
-			}
-		}
+	_ = json.NewEncoder(w).Encode(browsers)
+}
+
+// withoutCredentials returns a deep copy of browsers with host credentials
+// removed. Loaded quota shares host structs with routes, so it must never be
+// modified in place.
+func withoutCredentials(browsers []config.Browser) []config.Browser {
+	if browsers == nil {
+		return nil
 	}
-	_ = json.NewEncoder(w).Encode(browsers.Browsers.Browsers)
+	ret := make([]config.Browser, len(browsers))
+	for i, b := range browsers {
+		b.Versions = append([]config.Version(nil), b.Versions...)
+		for j, v := range b.Versions {
+			v.Regions = append([]config.Region(nil), v.Regions...)
+			for k, r := range v.Regions {
+				r.Hosts = append(config.Hosts(nil), r.Hosts...)
+				for l := range r.Hosts {
+					r.Hosts[l].Username = ""
+					r.Hosts[l].Password = ""
+				}
+				v.Regions[k] = r
+			}
+			b.Versions[j] = v
+		}
+		ret[i] = b
+	}
+	return ret
 }
 
 func postOnly(handler http.HandlerFunc) http.HandlerFunc {

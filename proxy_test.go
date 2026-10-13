@@ -216,6 +216,14 @@ func TestGetQuotaInfo(t *testing.T) {
 			}},
 		}}}
 	assert.Equal(t, fetchedBrowsers, browsersWithoutCredentials)
+
+	confLock.RLock()
+	h := quota[user].Browsers.Browsers[0].Versions[0].Regions[0].Hosts[0]
+	routed := routes[h.Sum()]
+	confLock.RUnlock()
+	assert.Equal(t, "test", h.Username, "/quota must not wipe credentials in loaded quota")
+	assert.Equal(t, "test", h.Password)
+	assert.Equal(t, "test", routed.Username, "/quota must not wipe credentials used for routing")
 }
 
 func TestProxyScreenVNCProtocol(t *testing.T) {
