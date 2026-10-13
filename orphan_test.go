@@ -27,9 +27,10 @@ func TestClientGoneSessionDeleted(t *testing.T) {
 
 	r := <-createSessionAsync(ctx)
 	assert.Error(t, r.err)
+	// The fake host records the DELETE before Ggr reads its answer, so wait
+	// for the metric that Ggr updates last.
 	waitFor(t, "the orphan session to be deleted", func() bool {
-		_, _, deleted := f.counters()
-		return len(deleted) == 1
+		return testutil.ToFloat64(metricOrphansDeleted.WithLabelValues("ok")) == before+1
 	})
 	_, _, deleted := f.counters()
 	assert.Equal(t, []string{"s1"}, deleted)
