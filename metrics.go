@@ -48,4 +48,15 @@ var (
 		Name: "ggr_host_breaker_open",
 		Help: "1 while the circuit breaker of a host is open.",
 	}, []string{"host"})
+
+	metricQueueLength = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "ggr_queue_length",
+		Help: "New session requests waiting for a free host.",
+	})
+
+	metricQueueWait = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "ggr_queue_wait_seconds",
+		Help:    "Time new session requests spent in the queue, by result.",
+		Buckets: []float64{0.5, 1, 2.5, 5, 10, 30, 60, 120, 300, 600},
+	}, []string{"result"})
 )

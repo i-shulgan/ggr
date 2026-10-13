@@ -358,6 +358,13 @@ type newSession struct {
 	attempts      int
 	startFailures int
 	lastHostError string
+	// result is how the request ended, see resultCreated and others.
+	result string
+}
+
+func (s *newSession) finish(result string) {
+	s.result = result
+	metricRequests.WithLabelValues(result).Inc()
 }
 
 func (s *newSession) fmtBrowser() string {
@@ -419,14 +426,21 @@ func route(w http.ResponseWriter, r *http.Request) {
 	hosts, s.version, _ = s.browsers.find(s.browser, s.version, s.platform, s.excluded, newSet())
 	if len(hosts) == 0 {
 		reply(w, errMsg(fmt.Sprintf("unsupported browser: %s", s.fmtBrowser())), http.StatusNotFound)
-		metricRequests.WithLabelValues(resultUnsupported).Inc()
+		s.finish(resultUnsupported)
 		s.log("UNSUPPORTED_BROWSER", "", "", false, "")
 		return
 	}
-	if s.round(w, r) == roundDone {
-		return
+	switch s.round(w, r) {
+	case roundDone:
+	case roundBusy:
+		if queueTimeout > 0 {
+			s.wait(w, r)
+			return
+		}
+		s.fail(w, http.StatusInternalServerError, "", resultFailed)
+	case roundExhausted:
+		s.fail(w, http.StatusInternalServerError, "", resultFailed)
 	}
-	s.fail(w, http.StatusInternalServerError, "", resultFailed)
 }
 
 // candidates returns hosts that may be tried in the current round.
@@ -468,7 +482,10 @@ func (s *newSession) round(w http.ResponseWriter, r *http.Request) roundResult {
 		}
 		s.attempts++
 		r.Header.Del("X-Selenoid-No-Wait")
-		if len(hosts) != 1 {
+		// With a single host left Selenoid may queue the request itself,
+		// unless Ggr queues: then hosts must answer at once so that the
+		// session goes to whichever host frees a slot first.
+		if queueTimeout > 0 || len(hosts) != 1 {
 			r.Header.Add("X-Selenoid-No-Wait", "")
 		}
 		s.log("SESSION_ATTEMPTED", host, "", true, "")
@@ -477,7 +494,7 @@ func (s *newSession) round(w http.ResponseWriter, r *http.Request) roundResult {
 		resp, status := session(r.Context(), h, r.Header, s.caps)
 		if r.Context().Err() != nil {
 			breakerRelease(host)
-			metricRequests.WithLabelValues(resultCanceled).Inc()
+			s.finish(resultCanceled)
 			s.log("CLIENT_DISCONNECTED", host, "", true, "")
 			return roundDone
 		}
@@ -546,7 +563,7 @@ func (s *newSession) created(w http.ResponseWriter, r *http.Request, h *config.H
 		sess, ok = valueMap["sessionId"].(string)
 		if !ok {
 			reply(w, errMsg("protocol error"), http.StatusBadGateway)
-			metricRequests.WithLabelValues(resultBadResponse).Inc()
+			s.finish(resultBadResponse)
 			s.log("BAD_RESPONSE", h.Net(), "", false, "")
 			return
 		}
@@ -556,7 +573,7 @@ func (s *newSession) created(w http.ResponseWriter, r *http.Request, h *config.H
 	reply(w, resp, http.StatusOK)
 	atomic.AddUint64(&numSessions, 1)
 	metricSessionsCreated.WithLabelValues(h.Net()).Inc()
-	metricRequests.WithLabelValues(resultCreated).Inc()
+	s.finish(resultCreated)
 	s.log("SESSION_CREATED", h.Net(), sess, true, "")
 }
 
@@ -570,7 +587,7 @@ func (s *newSession) fail(w http.ResponseWriter, code int, reason string, result
 		msg = fmt.Sprintf("%s, last host error was: %s", msg, s.lastHostError)
 	}
 	reply(w, errMsg(msg), code)
-	metricRequests.WithLabelValues(result).Inc()
+	s.finish(result)
 	s.log("SESSION_NOT_CREATED", "", "", false, reason)
 }
 
