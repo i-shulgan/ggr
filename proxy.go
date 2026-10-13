@@ -22,6 +22,7 @@ import (
 
 	"github.com/abbot/go-http-auth"
 	"github.com/aerokube/ggr/config"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"golang.org/x/net/websocket"
 )
 
@@ -41,7 +42,7 @@ const (
 )
 
 var paths = struct {
-	Ping, Status, Err, Host, Quota, Route, Proxy, VNC, Video, Logs, Download, Clipboard, Devtools, Pprof string
+	Ping, Status, Err, Host, Quota, Route, Proxy, VNC, Video, Logs, Download, Clipboard, Devtools, Pprof, Metrics string
 }{
 	Ping:      "/ping",
 	Status:    "/wd/hub/status",
@@ -57,6 +58,7 @@ var paths = struct {
 	Clipboard: "/clipboard/",
 	Devtools:  "/devtools/",
 	Pprof:     "/debug/pprof/",
+	Metrics:   "/metrics",
 }
 
 var keys = struct {
@@ -356,6 +358,7 @@ func route(w http.ResponseWriter, r *http.Request) {
 
 	if len(hosts) == 0 {
 		reply(w, errMsg(fmt.Sprintf("unsupported browser: %s", fmtBrowser(browser, version, platform, labels))), http.StatusNotFound)
+		metricRequests.WithLabelValues(resultUnsupported).Inc()
 		log.Printf("[%d] [%.2fs] [UNSUPPORTED_BROWSER] [%s] [%s] [%s] [-] [-] [-] [-]\n", id, secondsSince(start), user, remote, fmtBrowser(browser, version, platform, labels))
 		return
 	}
@@ -372,9 +375,11 @@ loop:
 		}
 		log.Printf("[%d] [%.2fs] [SESSION_ATTEMPTED] [%s] [%s] [%s] [%s] [-] [%d] [-]\n", id, secondsSince(start), user, remote, fmtBrowser(browser, version, platform, labels), h.Net(), count)
 		c.setVersion(version)
+		metricAttempts.WithLabelValues(h.Net()).Inc()
 		resp, status := session(r.Context(), h, r.Header, c)
 		select {
 		case <-r.Context().Done():
+			metricRequests.WithLabelValues(resultCanceled).Inc()
 			log.Printf("[%d] [%.2fs] [CLIENT_DISCONNECTED] [%s] [%s] [%s] [%s] [-] [%d] [-]\n", id, secondsSince(start), user, remote, fmtBrowser(browser, version, platform, labels), h.Net(), count)
 			return
 		default:
@@ -385,6 +390,7 @@ loop:
 			if !ok {
 				protocolError := func() {
 					reply(w, errMsg("protocol error"), http.StatusBadGateway)
+					metricRequests.WithLabelValues(resultBadResponse).Inc()
 					log.Printf("[%d] [%.2fs] [BAD_RESPONSE] [%s] [%s] [%s] [%s] [-] [-] [-]\n", id, secondsSince(start), user, remote, fmtBrowser(browser, version, platform, labels), h.Net())
 				}
 				value, ok := resp["value"]
@@ -409,11 +415,15 @@ loop:
 			}
 			reply(w, resp, http.StatusOK)
 			atomic.AddUint64(&numSessions, 1)
+			metricSessionsCreated.WithLabelValues(h.Net()).Inc()
+			metricRequests.WithLabelValues(resultCreated).Inc()
 			log.Printf("[%d] [%.2fs] [SESSION_CREATED] [%s] [%s] [%s] [%s] [%s] [%d] [-]\n", id, secondsSince(start), user, remote, fmtBrowser(browser, version, platform, labels), h.Net(), sess, count)
 			return
 		case browserFailed:
+			metricFailures.WithLabelValues(h.Net(), reasonStartFailed).Inc()
 			hosts = append(hosts[:i], hosts[i+1:]...)
 		case seleniumError:
+			metricFailures.WithLabelValues(h.Net(), reasonHostError).Inc()
 			excludedHosts.add(h.Net())
 			excludedRegions.add(h.Region)
 			hosts, version, excludedRegions = browsers.find(browser, version, platform, excludedHosts, excludedRegions)
@@ -430,6 +440,7 @@ loop:
 		notCreatedMsg = fmt.Sprintf("%s, last host error was: %s", notCreatedMsg, lastHostError)
 	}
 	reply(w, errMsg(notCreatedMsg), http.StatusInternalServerError)
+	metricRequests.WithLabelValues(resultFailed).Inc()
 	log.Printf("[%d] [%.2fs] [SESSION_NOT_CREATED] [%s] [%s] [%s] [-] [-] [-] [-]\n", id, secondsSince(start), user, remote, fmtBrowser(browser, version, platform, labels))
 }
 
@@ -888,5 +899,6 @@ func mux() http.Handler {
 	mux.HandleFunc(paths.Clipboard, WithSuitableAuthentication(authenticator, clipboard))
 	mux.HandleFunc(paths.Devtools, devtools)
 	mux.Handle(paths.Pprof, http.DefaultServeMux)
+	mux.Handle(paths.Metrics, promhttp.Handler())
 	return mux
 }

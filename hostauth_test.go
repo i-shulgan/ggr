@@ -21,6 +21,10 @@ func singleHostQuota(h config.Host) config.Browsers {
 		}}}}
 }
 
+func singleHostNode(host string, port int) config.Host {
+	return config.Host{Name: host, Port: port, Count: 1}
+}
+
 func TestProxySendsHostCredentials(t *testing.T) {
 	var got []string
 	mux := http.NewServeMux()
