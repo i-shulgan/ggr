@@ -30,6 +30,7 @@ const (
 	browserStarted = iota
 	browserFailed
 	seleniumError
+	hostBusy
 )
 
 const (
@@ -231,9 +232,20 @@ func session(ctx context.Context, h *config.Host, header http.Header, c caps) (m
 		return nil, seleniumError
 	}
 	if resp.StatusCode != http.StatusOK {
+		if resp.StatusCode == http.StatusTooManyRequests || isBusyMessage(browserErrMsg(reply)) {
+			return reply, hostBusy
+		}
 		return reply, browserFailed
 	}
 	return reply, browserStarted
+}
+
+// isBusyMessage tells "no free slots" from real browser start errors.
+// Selenoid answers "Too Many Requests" when X-Selenoid-No-Wait is set and the
+// limit is reached, and "queue is full" when started with -disable-queue.
+func isBusyMessage(msg string) bool {
+	msg = strings.ToLower(msg)
+	return strings.Contains(msg, "too many requests") || strings.Contains(msg, "queue is full")
 }
 
 // setHostAuth replaces the client credentials with the ones from quota when
@@ -332,116 +344,234 @@ func errMsg(msg string) map[string]interface{} {
 	}
 }
 
+// newSession is the state of one new session request.
+type newSession struct {
+	id                                 uint64
+	start                              time.Time
+	user, remote                       string
+	browser, version, platform, labels string
+	caps                               caps
+	browsers                           ggrBrowsers
+	// excluded hosts are not tried again during this request: they failed to
+	// start a browser, or did not answer while the circuit breaker is off.
+	excluded      *setImpl
+	attempts      int
+	startFailures int
+	lastHostError string
+}
+
+func (s *newSession) fmtBrowser() string {
+	return fmtBrowser(s.browser, s.version, s.platform, s.labels)
+}
+
+// log writes a line in the usual format:
+// [id] [duration] [STATUS] [user] [remote] [browser] [host] [session] [attempt] [message]
+func (s *newSession) log(status, host, sess string, attempt bool, msg string) {
+	count := "-"
+	if attempt {
+		count = fmt.Sprint(s.attempts)
+	}
+	log.Printf("[%d] [%.2fs] [%s] [%s] [%s] [%s] [%s] [%s] [%s] [%s]\n", s.id, secondsSince(s.start), status, s.user, s.remote, s.fmtBrowser(), dash(host), dash(sess), count, dash(msg))
+}
+
+func dash(s string) string {
+	if s == "" {
+		return "-"
+	}
+	return s
+}
+
+// roundResult says what happened during one pass over the hosts.
+type roundResult int
+
+const (
+	// roundDone means that the response was sent or the client went away.
+	roundDone roundResult = iota
+	// roundBusy means that some hosts may accept the session later: they
+	// were busy or closed by the circuit breaker.
+	roundBusy
+	// roundExhausted means that no host is left to try for this request.
+	roundExhausted
+)
+
 func route(w http.ResponseWriter, r *http.Request) {
-	start := time.Now()
-	id := serial()
-	user, remote := info(r)
+	s := &newSession{start: time.Now(), id: serial()}
+	s.user, s.remote = info(r)
 	var c caps
 	err := json.NewDecoder(r.Body).Decode(&c)
 	if err != nil {
 		reply(w, errMsg(fmt.Sprintf("bad json format: %s", err.Error())), http.StatusBadRequest)
-		log.Printf("[%d] [%.2fs] [BAD_JSON] [%s] [%s] [-] [-] [-] [-] [%v]\n", id, secondsSince(start), user, remote, err)
+		log.Printf("[%d] [%.2fs] [BAD_JSON] [%s] [%s] [-] [-] [-] [-] [%v]\n", s.id, secondsSince(s.start), s.user, s.remote, err)
 		return
 	}
-	browser, version, platform, labels := c.browser(), c.version(), c.platform(), c.labels()
-	if browser == "" {
+	s.caps = c
+	s.browser, s.version, s.platform, s.labels = c.browser(), c.version(), c.platform(), c.labels()
+	if s.browser == "" {
 		reply(w, errMsg("browser not set"), http.StatusBadRequest)
-		log.Printf("[%d] [%.2fs] [BROWSER_NOT_SET] [%s] [%s] [-] [-] [-] [-] [-]\n", id, secondsSince(start), user, remote)
+		log.Printf("[%d] [%.2fs] [BROWSER_NOT_SET] [%s] [%s] [-] [-] [-] [-] [-]\n", s.id, secondsSince(s.start), s.user, s.remote)
 		return
 	}
-	count := 0
 	confLock.RLock()
-	browsers := quota[user]
-	excludedHosts := newSet()
-	hosts, version, excludedRegions := browsers.find(browser, version, platform, excludedHosts, newSet())
+	s.browsers = quota[s.user]
 	confLock.RUnlock()
-
+	s.excluded = newSet()
+	var hosts config.Hosts
+	hosts, s.version, _ = s.browsers.find(s.browser, s.version, s.platform, s.excluded, newSet())
 	if len(hosts) == 0 {
-		reply(w, errMsg(fmt.Sprintf("unsupported browser: %s", fmtBrowser(browser, version, platform, labels))), http.StatusNotFound)
+		reply(w, errMsg(fmt.Sprintf("unsupported browser: %s", s.fmtBrowser())), http.StatusNotFound)
 		metricRequests.WithLabelValues(resultUnsupported).Inc()
-		log.Printf("[%d] [%.2fs] [UNSUPPORTED_BROWSER] [%s] [%s] [%s] [-] [-] [-] [-]\n", id, secondsSince(start), user, remote, fmtBrowser(browser, version, platform, labels))
+		s.log("UNSUPPORTED_BROWSER", "", "", false, "")
 		return
 	}
-	lastHostError := ""
-loop:
-	for h, i := choose(hosts); ; h, i = choose(hosts) {
-		count++
+	if s.round(w, r) == roundDone {
+		return
+	}
+	s.fail(w, http.StatusInternalServerError, "", resultFailed)
+}
+
+// candidates returns hosts that may be tried in the current round.
+// unavailable is set when some hosts were skipped by the circuit breaker.
+func (s *newSession) candidates(excludedHosts set, excludedRegions set) (hosts config.Hosts, regions set, unavailable bool) {
+	all, version, regions := s.browsers.find(s.browser, s.version, s.platform, excludedHosts, excludedRegions)
+	s.version = version
+	for _, h := range all {
+		if breakerAvailable(h.Net()) {
+			hosts = append(hosts, h)
+		} else {
+			unavailable = true
+		}
+	}
+	return hosts, regions, unavailable
+}
+
+// round tries every host available for the request once, until a session
+// is created.
+func (s *newSession) round(w http.ResponseWriter, r *http.Request) roundResult {
+	excludedHosts := newSet()
+	for host := range s.excluded.data {
+		excludedHosts.add(host)
+	}
+	hosts, excludedRegions, unavailable := s.candidates(excludedHosts, newSet())
+	busy := unavailable
+	for len(hosts) > 0 {
+		h, i := choose(hosts)
+		if h == nil {
+			break
+		}
+		host := h.Net()
+		if !breakerAcquire(host) {
+			// Another request is probing this host right now.
+			busy = true
+			excludedHosts.add(host)
+			hosts = append(hosts[:i], hosts[i+1:]...)
+			continue
+		}
+		s.attempts++
 		r.Header.Del("X-Selenoid-No-Wait")
 		if len(hosts) != 1 {
 			r.Header.Add("X-Selenoid-No-Wait", "")
 		}
-		if h == nil {
-			break loop
-		}
-		log.Printf("[%d] [%.2fs] [SESSION_ATTEMPTED] [%s] [%s] [%s] [%s] [-] [%d] [-]\n", id, secondsSince(start), user, remote, fmtBrowser(browser, version, platform, labels), h.Net(), count)
-		c.setVersion(version)
-		metricAttempts.WithLabelValues(h.Net()).Inc()
-		resp, status := session(r.Context(), h, r.Header, c)
-		select {
-		case <-r.Context().Done():
+		s.log("SESSION_ATTEMPTED", host, "", true, "")
+		s.caps.setVersion(s.version)
+		metricAttempts.WithLabelValues(host).Inc()
+		resp, status := session(r.Context(), h, r.Header, s.caps)
+		if r.Context().Err() != nil {
+			breakerRelease(host)
 			metricRequests.WithLabelValues(resultCanceled).Inc()
-			log.Printf("[%d] [%.2fs] [CLIENT_DISCONNECTED] [%s] [%s] [%s] [%s] [-] [%d] [-]\n", id, secondsSince(start), user, remote, fmtBrowser(browser, version, platform, labels), h.Net(), count)
-			return
-		default:
+			s.log("CLIENT_DISCONNECTED", host, "", true, "")
+			return roundDone
 		}
+		reason := ""
 		switch status {
 		case browserStarted:
-			sess, ok := resp["sessionId"].(string)
-			if !ok {
-				protocolError := func() {
-					reply(w, errMsg("protocol error"), http.StatusBadGateway)
-					metricRequests.WithLabelValues(resultBadResponse).Inc()
-					log.Printf("[%d] [%.2fs] [BAD_RESPONSE] [%s] [%s] [%s] [%s] [-] [-] [-]\n", id, secondsSince(start), user, remote, fmtBrowser(browser, version, platform, labels), h.Net())
-				}
-				value, ok := resp["value"]
-				if !ok {
-					protocolError()
-					return
-				}
-				valueMap, ok := value.(map[string]interface{})
-				if !ok {
-					protocolError()
-					return
-				}
-				sess, ok = valueMap["sessionId"].(string)
-				if !ok {
-					protocolError()
-					return
-				}
-				valueMap["sessionId"] = h.Sum() + sess
-				rewriteCDP(r, valueMap, h.Sum()+sess)
-			} else {
-				resp["sessionId"] = h.Sum() + sess
-			}
-			reply(w, resp, http.StatusOK)
-			atomic.AddUint64(&numSessions, 1)
-			metricSessionsCreated.WithLabelValues(h.Net()).Inc()
-			metricRequests.WithLabelValues(resultCreated).Inc()
-			log.Printf("[%d] [%.2fs] [SESSION_CREATED] [%s] [%s] [%s] [%s] [%s] [%d] [-]\n", id, secondsSince(start), user, remote, fmtBrowser(browser, version, platform, labels), h.Net(), sess, count)
-			return
+			breakerSuccess(host)
+			s.created(w, r, h, resp)
+			return roundDone
+		case hostBusy:
+			breakerSuccess(host)
+			reason = reasonBusy
+			busy = true
+			excludedHosts.add(host)
+			hosts = append(hosts[:i], hosts[i+1:]...)
 		case browserFailed:
-			metricFailures.WithLabelValues(h.Net(), reasonStartFailed).Inc()
+			breakerSuccess(host)
+			reason = reasonStartFailed
+			s.startFailures++
+			s.excluded.add(host)
+			excludedHosts.add(host)
 			hosts = append(hosts[:i], hosts[i+1:]...)
 		case seleniumError:
-			metricFailures.WithLabelValues(h.Net(), reasonHostError).Inc()
-			excludedHosts.add(h.Net())
+			breakerFailure(host)
+			reason = reasonHostError
+			if breakerEnabled() {
+				busy = true
+			} else {
+				s.excluded.add(host)
+			}
+			excludedHosts.add(host)
 			excludedRegions.add(h.Region)
-			hosts, version, excludedRegions = browsers.find(browser, version, platform, excludedHosts, excludedRegions)
+			var skipped bool
+			hosts, excludedRegions, skipped = s.candidates(excludedHosts, excludedRegions)
+			busy = busy || skipped
 		}
-		errMsg := browserErrMsg(resp)
-		log.Printf("[%d] [%.2fs] [SESSION_FAILED] [%s] [%s] [%s] [%s] [-] [%d] [%s]\n", id, secondsSince(start), user, remote, fmtBrowser(browser, version, platform, labels), h.Net(), count, errMsg)
-		lastHostError = errMsg
-		if len(hosts) == 0 {
-			break loop
+		metricFailures.WithLabelValues(host, reason).Inc()
+		msg := browserErrMsg(resp)
+		s.log("SESSION_FAILED", host, "", true, msg)
+		if msg != "" {
+			s.lastHostError = msg
+		} else if reason == reasonBusy {
+			s.lastHostError = "host is busy"
+		}
+		if reason == reasonStartFailed && maxStartFailures > 0 && s.startFailures >= maxStartFailures {
+			s.lastHostError = fmt.Sprintf("%s (gave up after %d browser start failure(s))", dash(s.lastHostError), s.startFailures)
+			return roundExhausted
 		}
 	}
-	notCreatedMsg := fmt.Sprintf("cannot create session %s on any hosts after %d attempt(s)", fmtBrowser(browser, version, platform, labels), count)
-	if len(lastHostError) > 0 {
-		notCreatedMsg = fmt.Sprintf("%s, last host error was: %s", notCreatedMsg, lastHostError)
+	if busy {
+		if s.attempts == 0 && s.lastHostError == "" {
+			s.lastHostError = "all hosts are temporarily unavailable"
+		}
+		return roundBusy
 	}
-	reply(w, errMsg(notCreatedMsg), http.StatusInternalServerError)
-	metricRequests.WithLabelValues(resultFailed).Inc()
-	log.Printf("[%d] [%.2fs] [SESSION_NOT_CREATED] [%s] [%s] [%s] [-] [-] [-] [-]\n", id, secondsSince(start), user, remote, fmtBrowser(browser, version, platform, labels))
+	return roundExhausted
+}
+
+// created replies with the session ID prefixed by the host hash.
+func (s *newSession) created(w http.ResponseWriter, r *http.Request, h *config.Host, resp map[string]interface{}) {
+	sess, ok := resp["sessionId"].(string)
+	if ok {
+		resp["sessionId"] = h.Sum() + sess
+	} else {
+		valueMap, _ := resp["value"].(map[string]interface{})
+		sess, ok = valueMap["sessionId"].(string)
+		if !ok {
+			reply(w, errMsg("protocol error"), http.StatusBadGateway)
+			metricRequests.WithLabelValues(resultBadResponse).Inc()
+			s.log("BAD_RESPONSE", h.Net(), "", false, "")
+			return
+		}
+		valueMap["sessionId"] = h.Sum() + sess
+		rewriteCDP(r, valueMap, h.Sum()+sess)
+	}
+	reply(w, resp, http.StatusOK)
+	atomic.AddUint64(&numSessions, 1)
+	metricSessionsCreated.WithLabelValues(h.Net()).Inc()
+	metricRequests.WithLabelValues(resultCreated).Inc()
+	s.log("SESSION_CREATED", h.Net(), sess, true, "")
+}
+
+// fail replies that no session was created.
+func (s *newSession) fail(w http.ResponseWriter, code int, reason string, result string) {
+	msg := fmt.Sprintf("cannot create session %s on any hosts after %d attempt(s)", s.fmtBrowser(), s.attempts)
+	if reason != "" {
+		msg = fmt.Sprintf("%s: %s", msg, reason)
+	}
+	if len(s.lastHostError) > 0 {
+		msg = fmt.Sprintf("%s, last host error was: %s", msg, s.lastHostError)
+	}
+	reply(w, errMsg(msg), code)
+	metricRequests.WithLabelValues(result).Inc()
+	s.log("SESSION_NOT_CREATED", "", "", false, reason)
 }
 
 func secondsSince(start time.Time) float64 {

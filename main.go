@@ -26,6 +26,7 @@ var (
 	guestUserName      = "guest"
 	rootToken          string
 	verbose            bool
+	maxStartFailures   int
 
 	startTime      = time.Now()
 	lastReloadTime = time.Now()
@@ -120,6 +121,9 @@ func parseFlags() {
 	flag.StringVar(&rootToken, "root-token", rootToken, "Root token value")
 	flag.BoolVar(&version, "version", version, "show version and exit")
 	flag.BoolVar(&verbose, "verbose", verbose, "enable verbose mode")
+	flag.IntVar(&maxStartFailures, "max-start-failures", maxStartFailures, "give up a new session request after this many browser start errors on different hosts (0 - try every host)")
+	flag.DurationVar(&breakerTimeout, "breaker-timeout", breakerTimeout, "do not send new sessions to a host for this long after it stopped answering (0 - disabled, skip it for the current request only)")
+	flag.IntVar(&breakerThreshold, "breaker-threshold", breakerThreshold, "consecutive connection errors that open the circuit breaker of a host")
 	flag.Parse()
 }
 

@@ -626,7 +626,7 @@ func TestCreateSessionNoHosts(t *testing.T) {
 
 	assert.NoError(t, err)
 	assert.Equal(t, rsp.StatusCode, http.StatusInternalServerError)
-	assert.Equal(t, message(rsp), "cannot create session browser-1.0 on any hosts after 1 attempt(s)")
+	assert.Equal(t, message(rsp), "cannot create session browser-1.0 on any hosts after 0 attempt(s)")
 }
 
 func TestCreateSessionHostDown(t *testing.T) {

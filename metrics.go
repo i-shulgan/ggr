@@ -44,4 +44,8 @@ var (
 		Help: "New session requests, by result.",
 	}, []string{"result"})
 
+	metricBreakerOpen = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "ggr_host_breaker_open",
+		Help: "1 while the circuit breaker of a host is open.",
+	}, []string{"host"})
 )
