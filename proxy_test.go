@@ -1584,6 +1584,7 @@ func TestStartSessionProxyHeaders(t *testing.T) {
 
 func TestStartSessionGuest(t *testing.T) {
 	guestAccessAllowed = true
+	defer func() { guestAccessAllowed = false }()
 
 	dummyMux := http.NewServeMux()
 	dummyMux.HandleFunc("/wd/hub/session", postOnly(func(w http.ResponseWriter, r *http.Request) {
@@ -1618,6 +1619,7 @@ func TestStartSessionGuest(t *testing.T) {
 
 func TestStartSessionGuestFailNoQuota(t *testing.T) {
 	guestAccessAllowed = true
+	defer func() { guestAccessAllowed = false }()
 
 	dummyMux := http.NewServeMux()
 	dummyMux.HandleFunc("/wd/hub/session", postOnly(func(w http.ResponseWriter, r *http.Request) {
@@ -1638,6 +1640,7 @@ func TestStartSessionGuestFailNoQuota(t *testing.T) {
 
 func TestStartSessionGuestAndCorrectBasicAuth(t *testing.T) {
 	guestAccessAllowed = true
+	defer func() { guestAccessAllowed = false }()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/wd/hub/session", postOnly(func(w http.ResponseWriter, r *http.Request) {
@@ -1660,6 +1663,7 @@ func TestStartSessionGuestAndCorrectBasicAuth(t *testing.T) {
 
 func TestStartSessionGuestModeAndWrongBasicAuth(t *testing.T) {
 	guestAccessAllowed = true
+	defer func() { guestAccessAllowed = false }()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/wd/hub/session", postOnly(func(w http.ResponseWriter, r *http.Request) {
@@ -1717,6 +1721,7 @@ func TestFileExists(t *testing.T) {
 
 func TestPanicGuestQuotaMissingUsersFileAuthPresent(t *testing.T) {
 	guestAccessAllowed = true
+	defer func() { guestAccessAllowed = false }()
 	users = "missing-file"
 	defer func() {
 		users = ".htpasswd"
