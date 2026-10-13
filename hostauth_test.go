@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -121,4 +122,31 @@ func TestCreateVNCInfoDefaultPorts(t *testing.T) {
 		assert.NotNil(t, got, vnc)
 		assert.Equal(t, want, *got, vnc)
 	}
+}
+
+func TestStartSessionRewritesCDPEndpoint(t *testing.T) {
+	selenium := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"value":{"sessionId":"123","capabilities":{"browserName":"chrome","se:cdp":"ws://` + r.Host + `/devtools/123/"}}}`))
+	}))
+	defer selenium.Close()
+
+	host, port := hostportnum(selenium.URL)
+	node := config.Host{Name: host, Port: port, Count: 1}
+
+	test.Lock()
+	defer test.Unlock()
+	updateQuota(user, singleHostQuota(node))
+
+	rsp, err := createSession(`{"capabilities":{"alwaysMatch":{"browserName":"browser"}}}`)
+	assert.NoError(t, err)
+	defer rsp.Body.Close()
+	var reply struct {
+		Value struct {
+			SessionID    string                 `json:"sessionId"`
+			Capabilities map[string]interface{} `json:"capabilities"`
+		} `json:"value"`
+	}
+	assert.NoError(t, json.NewDecoder(rsp.Body).Decode(&reply))
+	assert.Equal(t, node.Sum()+"123", reply.Value.SessionID)
+	assert.Equal(t, "ws://"+hostport(srv.URL)+"/devtools/"+node.Sum()+"123/", reply.Value.Capabilities["se:cdp"])
 }

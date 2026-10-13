@@ -243,6 +243,28 @@ func setHostAuth(header http.Header, h *config.Host) {
 	}
 }
 
+// rewriteCDP points the Selenium 4 se:cdp capability returned by Selenoid
+// (ws://<selenoid>/devtools/<id>/) to the /devtools/ endpoint of Ggr, so that
+// clients connect through Ggr with the Ggr session ID.
+func rewriteCDP(r *http.Request, value map[string]interface{}, sessionID string) {
+	c, ok := value["capabilities"].(map[string]interface{})
+	if !ok {
+		return
+	}
+	if _, ok := c["se:cdp"].(string); !ok {
+		return
+	}
+	scheme := "ws"
+	if r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https") {
+		scheme = "wss"
+	}
+	host := r.Host
+	if fh := r.Header.Get("X-Forwarded-Host"); fh != "" {
+		host = fh
+	}
+	c["se:cdp"] = fmt.Sprintf("%s://%s%s%s/", scheme, host, paths.Devtools, sessionID)
+}
+
 func reply(w http.ResponseWriter, msg map[string]interface{}, status int) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
@@ -380,7 +402,8 @@ loop:
 					protocolError()
 					return
 				}
-				resp["value"].(map[string]interface{})["sessionId"] = h.Sum() + sess
+				valueMap["sessionId"] = h.Sum() + sess
+				rewriteCDP(r, valueMap, h.Sum()+sess)
 			} else {
 				resp["sessionId"] = h.Sum() + sess
 			}
