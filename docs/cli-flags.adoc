@@ -3,6 +3,10 @@
 The following flags are supported by ```ggr``` command:
 [source,bash]
 ----
+  -breaker-threshold int
+    	consecutive connection errors that open the circuit breaker of a host (default 1)
+  -breaker-timeout duration
+    	do not send new sessions to a host for this long after it stopped answering (0 - disabled, skip it for the current request only)
   -graceful-period duration
     	graceful shutdown period in time.Duration format, e.g. 300s or 500ms (default 5m0s)
   -guests-allowed
@@ -11,8 +15,22 @@ The following flags are supported by ```ggr``` command:
     	Which quota file to use for guests (default "guest")
   -listen string
     	host and port to listen to (default ":4444")
+  -max-queue int
+    	maximum number of new session requests waiting for a free host, others get 503 (0 - unlimited)
+  -max-start-failures int
+    	give up a new session request after this many browser start errors on different hosts (0 - try every host)
+  -queue-backoff duration
+    	initial delay between passes over busy hosts, doubled up to -queue-backoff-max (default 250ms)
+  -queue-backoff-max duration
+    	maximum delay between passes over busy hosts (default 5s)
+  -queue-timeout duration
+    	wait this long for a free host when all hosts are busy instead of failing at once (0 - disabled)
   -quotaDir string
     	quota directory (default "quota")
+  -root-token string
+    	Root token value
+  -status-interval duration
+    	poll /status of hosts this often and prefer hosts with free slots (0 - disabled, weighted random by count)
   -timeout duration
     	session creation timeout in time.Duration format, e.g. 300s or 500ms (default 5m0s)
   -users string
@@ -35,7 +53,7 @@ When using Ggr inside Docker container these flags are passed like the following
 ----
 # docker run -d --name \
     ggr -v /etc/grid-router/:/etc/grid-router:ro \
-    --net host aerokube/ggr:latest-release
+    --net host ghcr.io/i-shulgan/ggr:latest
     -quotaDir /my/custom/quota/dir
 ----
 

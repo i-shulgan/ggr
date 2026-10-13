@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"encoding/xml"
 	"fmt"
@@ -20,7 +21,8 @@ import (
 	"time"
 
 	"github.com/abbot/go-http-auth"
-	. "github.com/aerokube/ggr/config"
+	"github.com/aerokube/ggr/config"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"golang.org/x/net/websocket"
 )
 
@@ -28,6 +30,7 @@ const (
 	browserStarted = iota
 	browserFailed
 	seleniumError
+	hostBusy
 )
 
 const (
@@ -36,10 +39,11 @@ const (
 	defaultVNCPort = "5900"
 	vncScheme      = "vnc"
 	wsScheme       = "ws"
+	wssScheme      = "wss"
 )
 
 var paths = struct {
-	Ping, Status, Err, Host, Quota, Route, Proxy, VNC, Video, Logs, Download, Clipboard, Devtools, Pprof string
+	Ping, Status, Err, Host, Quota, Route, Proxy, VNC, Video, Logs, Download, Clipboard, Devtools, Pprof, Metrics string
 }{
 	Ping:      "/ping",
 	Status:    "/wd/hub/status",
@@ -55,6 +59,7 @@ var paths = struct {
 	Clipboard: "/clipboard/",
 	Devtools:  "/devtools/",
 	Pprof:     "/debug/pprof/",
+	Metrics:   "/metrics",
 }
 
 var keys = struct {
@@ -85,7 +90,7 @@ var (
 )
 
 // Routes - an MD5 to host map
-type Routes map[string]*Host
+type Routes map[string]*config.Host
 
 type caps map[string]interface{}
 
@@ -190,7 +195,7 @@ func (c caps) setVersion(version string) {
 	})
 }
 
-func session(ctx context.Context, h *Host, header http.Header, c caps) (map[string]interface{}, int) {
+func session(ctx context.Context, h *config.Host, header http.Header, c caps) (map[string]interface{}, int) {
 	b, _ := json.Marshal(c)
 	req, err := http.NewRequest(http.MethodPost, sessionURL(h), bytes.NewReader(b))
 	if err != nil {
@@ -202,9 +207,7 @@ func session(ctx context.Context, h *Host, header http.Header, c caps) (map[stri
 		}
 	}
 	req.Header.Del("Accept-Encoding")
-	if h.Username != "" && h.Password != "" {
-		req.SetBasicAuth(h.Username, h.Password)
-	}
+	setHostAuth(req.Header, h)
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	req = req.WithContext(ctx)
@@ -229,9 +232,51 @@ func session(ctx context.Context, h *Host, header http.Header, c caps) (map[stri
 		return nil, seleniumError
 	}
 	if resp.StatusCode != http.StatusOK {
+		if resp.StatusCode == http.StatusTooManyRequests || isBusyMessage(browserErrMsg(reply)) {
+			return reply, hostBusy
+		}
 		return reply, browserFailed
 	}
 	return reply, browserStarted
+}
+
+// isBusyMessage tells "no free slots" from real browser start errors.
+// Selenoid answers "Too Many Requests" when X-Selenoid-No-Wait is set and the
+// limit is reached, and "queue is full" when started with -disable-queue.
+func isBusyMessage(msg string) bool {
+	msg = strings.ToLower(msg)
+	return strings.Contains(msg, "too many requests") || strings.Contains(msg, "queue is full")
+}
+
+// setHostAuth replaces the client credentials with the ones from quota when
+// the host has them.
+func setHostAuth(header http.Header, h *config.Host) {
+	if h.Username != "" && h.Password != "" {
+		auth := base64.StdEncoding.EncodeToString([]byte(h.Username + ":" + h.Password))
+		header.Set("Authorization", "Basic "+auth)
+	}
+}
+
+// rewriteCDP points the Selenium 4 se:cdp capability returned by Selenoid
+// (ws://<selenoid>/devtools/<id>/) to the /devtools/ endpoint of Ggr, so that
+// clients connect through Ggr with the Ggr session ID.
+func rewriteCDP(r *http.Request, value map[string]interface{}, sessionID string) {
+	c, ok := value["capabilities"].(map[string]interface{})
+	if !ok {
+		return
+	}
+	if _, ok := c["se:cdp"].(string); !ok {
+		return
+	}
+	scheme := "ws"
+	if r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https") {
+		scheme = "wss"
+	}
+	host := r.Host
+	if fh := r.Header.Get("X-Forwarded-Host"); fh != "" {
+		host = fh
+	}
+	c["se:cdp"] = fmt.Sprintf("%s://%s%s%s/", scheme, host, paths.Devtools, sessionID)
 }
 
 func reply(w http.ResponseWriter, msg map[string]interface{}, status int) {
@@ -299,162 +344,337 @@ func errMsg(msg string) map[string]interface{} {
 	}
 }
 
+// newSession is the state of one new session request.
+type newSession struct {
+	id                                 uint64
+	start                              time.Time
+	user, remote                       string
+	browser, version, platform, labels string
+	caps                               caps
+	browsers                           ggrBrowsers
+	// excluded hosts are not tried again during this request: they failed to
+	// start a browser, or did not answer while the circuit breaker is off.
+	excluded      *setImpl
+	attempts      int
+	startFailures int
+	lastHostError string
+	// result is how the request ended, see resultCreated and others.
+	result string
+}
+
+func (s *newSession) finish(result string) {
+	s.result = result
+	metricRequests.WithLabelValues(result).Inc()
+}
+
+func (s *newSession) fmtBrowser() string {
+	return fmtBrowser(s.browser, s.version, s.platform, s.labels)
+}
+
+// log writes a line in the usual format:
+// [id] [duration] [STATUS] [user] [remote] [browser] [host] [session] [attempt] [message]
+func (s *newSession) log(status, host, sess string, attempt bool, msg string) {
+	count := "-"
+	if attempt {
+		count = fmt.Sprint(s.attempts)
+	}
+	log.Printf("[%d] [%.2fs] [%s] [%s] [%s] [%s] [%s] [%s] [%s] [%s]\n", s.id, secondsSince(s.start), status, s.user, s.remote, s.fmtBrowser(), dash(host), dash(sess), count, dash(msg))
+}
+
+func dash(s string) string {
+	if s == "" {
+		return "-"
+	}
+	return s
+}
+
+// roundResult says what happened during one pass over the hosts.
+type roundResult int
+
+const (
+	// roundDone means that the response was sent or the client went away.
+	roundDone roundResult = iota
+	// roundBusy means that some hosts may accept the session later: they
+	// were busy or closed by the circuit breaker.
+	roundBusy
+	// roundExhausted means that no host is left to try for this request.
+	roundExhausted
+)
+
 func route(w http.ResponseWriter, r *http.Request) {
-	start := time.Now()
-	id := serial()
-	user, remote := info(r)
+	s := &newSession{start: time.Now(), id: serial()}
+	s.user, s.remote = info(r)
 	var c caps
 	err := json.NewDecoder(r.Body).Decode(&c)
 	if err != nil {
 		reply(w, errMsg(fmt.Sprintf("bad json format: %s", err.Error())), http.StatusBadRequest)
-		log.Printf("[%d] [%.2fs] [BAD_JSON] [%s] [%s] [-] [-] [-] [-] [%v]\n", id, secondsSince(start), user, remote, err)
+		log.Printf("[%d] [%.2fs] [BAD_JSON] [%s] [%s] [-] [-] [-] [-] [%v]\n", s.id, secondsSince(s.start), s.user, s.remote, err)
 		return
 	}
-	browser, version, platform, labels := c.browser(), c.version(), c.platform(), c.labels()
-	if browser == "" {
+	s.caps = c
+	s.browser, s.version, s.platform, s.labels = c.browser(), c.version(), c.platform(), c.labels()
+	if s.browser == "" {
 		reply(w, errMsg("browser not set"), http.StatusBadRequest)
-		log.Printf("[%d] [%.2fs] [BROWSER_NOT_SET] [%s] [%s] [-] [-] [-] [-] [-]\n", id, secondsSince(start), user, remote)
+		log.Printf("[%d] [%.2fs] [BROWSER_NOT_SET] [%s] [%s] [-] [-] [-] [-] [-]\n", s.id, secondsSince(s.start), s.user, s.remote)
 		return
 	}
-	count := 0
 	confLock.RLock()
-	browsers := quota[user]
-	excludedHosts := newSet()
-	hosts, version, excludedRegions := browsers.find(browser, version, platform, excludedHosts, newSet())
+	s.browsers = quota[s.user]
 	confLock.RUnlock()
-
+	s.excluded = newSet()
+	var hosts config.Hosts
+	hosts, s.version, _ = s.browsers.find(s.browser, s.version, s.platform, s.excluded, newSet())
 	if len(hosts) == 0 {
-		reply(w, errMsg(fmt.Sprintf("unsupported browser: %s", fmtBrowser(browser, version, platform, labels))), http.StatusNotFound)
-		log.Printf("[%d] [%.2fs] [UNSUPPORTED_BROWSER] [%s] [%s] [%s] [-] [-] [-] [-]\n", id, secondsSince(start), user, remote, fmtBrowser(browser, version, platform, labels))
+		reply(w, errMsg(fmt.Sprintf("unsupported browser: %s", s.fmtBrowser())), http.StatusNotFound)
+		s.finish(resultUnsupported)
+		s.log("UNSUPPORTED_BROWSER", "", "", false, "")
 		return
 	}
-	lastHostError := ""
-loop:
-	for h, i := choose(hosts); ; h, i = choose(hosts) {
-		count++
+	switch s.round(w, r) {
+	case roundDone:
+	case roundBusy:
+		if queueTimeout > 0 {
+			s.wait(w, r)
+			return
+		}
+		s.fail(w, http.StatusInternalServerError, "", resultFailed)
+	case roundExhausted:
+		s.fail(w, http.StatusInternalServerError, "", resultFailed)
+	}
+}
+
+// candidates returns hosts that may be tried in the current round.
+// unavailable is set when some hosts were skipped by the circuit breaker.
+func (s *newSession) candidates(excludedHosts set, excludedRegions set) (hosts config.Hosts, regions set, unavailable bool) {
+	all, version, regions := s.browsers.find(s.browser, s.version, s.platform, excludedHosts, excludedRegions)
+	s.version = version
+	for _, h := range all {
+		if breakerAvailable(h.Net()) {
+			hosts = append(hosts, h)
+		} else {
+			unavailable = true
+		}
+	}
+	return hosts, regions, unavailable
+}
+
+// round tries every host available for the request once, until a session
+// is created.
+func (s *newSession) round(w http.ResponseWriter, r *http.Request) roundResult {
+	excludedHosts := newSet()
+	for host := range s.excluded.data {
+		excludedHosts.add(host)
+	}
+	hosts, excludedRegions, unavailable := s.candidates(excludedHosts, newSet())
+	busy := unavailable
+	for len(hosts) > 0 {
+		h, i := pick(hosts)
+		if h == nil {
+			break
+		}
+		host := h.Net()
+		if !breakerAcquire(host) {
+			// Another request is probing this host right now.
+			busy = true
+			excludedHosts.add(host)
+			hosts = append(hosts[:i], hosts[i+1:]...)
+			continue
+		}
+		s.attempts++
 		r.Header.Del("X-Selenoid-No-Wait")
-		if len(hosts) != 1 {
+		// With a single host left Selenoid may queue the request itself,
+		// unless Ggr queues: then hosts must answer at once so that the
+		// session goes to whichever host frees a slot first.
+		if queueTimeout > 0 || len(hosts) != 1 {
 			r.Header.Add("X-Selenoid-No-Wait", "")
 		}
-		if h == nil {
-			break loop
+		s.log("SESSION_ATTEMPTED", host, "", true, "")
+		s.caps.setVersion(s.version)
+		metricAttempts.WithLabelValues(host).Inc()
+		noteAttempt(host)
+		ctx, cancel := attemptContext(r.Context())
+		resp, status := session(ctx, h, r.Header, s.caps)
+		cancel()
+		if r.Context().Err() != nil {
+			if status == seleniumError {
+				// Possibly aborted by us after orphanGrace: says nothing.
+				breakerRelease(host)
+			} else {
+				breakerSuccess(host)
+			}
+			s.finish(resultCanceled)
+			sess, ok := sessionIDOf(resp)
+			if status == browserStarted && ok {
+				s.log("CLIENT_DISCONNECTED", host, sess, true, "session created after the client went away")
+				s.deleteOrphan(h, sess)
+			} else {
+				s.log("CLIENT_DISCONNECTED", host, "", true, "")
+			}
+			return roundDone
 		}
-		log.Printf("[%d] [%.2fs] [SESSION_ATTEMPTED] [%s] [%s] [%s] [%s] [-] [%d] [-]\n", id, secondsSince(start), user, remote, fmtBrowser(browser, version, platform, labels), h.Net(), count)
-		c.setVersion(version)
-		resp, status := session(r.Context(), h, r.Header, c)
-		select {
-		case <-r.Context().Done():
-			log.Printf("[%d] [%.2fs] [CLIENT_DISCONNECTED] [%s] [%s] [%s] [%s] [-] [%d] [-]\n", id, secondsSince(start), user, remote, fmtBrowser(browser, version, platform, labels), h.Net(), count)
-			return
-		default:
-		}
+		reason := ""
 		switch status {
 		case browserStarted:
-			sess, ok := resp["sessionId"].(string)
-			if !ok {
-				protocolError := func() {
-					reply(w, errMsg("protocol error"), http.StatusBadGateway)
-					log.Printf("[%d] [%.2fs] [BAD_RESPONSE] [%s] [%s] [%s] [%s] [-] [-] [-]\n", id, secondsSince(start), user, remote, fmtBrowser(browser, version, platform, labels), h.Net())
-				}
-				value, ok := resp["value"]
-				if !ok {
-					protocolError()
-					return
-				}
-				valueMap, ok := value.(map[string]interface{})
-				if !ok {
-					protocolError()
-					return
-				}
-				sess, ok = valueMap["sessionId"].(string)
-				if !ok {
-					protocolError()
-					return
-				}
-				resp["value"].(map[string]interface{})["sessionId"] = h.Sum() + sess
-			} else {
-				resp["sessionId"] = h.Sum() + sess
-			}
-			reply(w, resp, http.StatusOK)
-			atomic.AddUint64(&numSessions, 1)
-			log.Printf("[%d] [%.2fs] [SESSION_CREATED] [%s] [%s] [%s] [%s] [%s] [%d] [-]\n", id, secondsSince(start), user, remote, fmtBrowser(browser, version, platform, labels), h.Net(), sess, count)
-			return
+			breakerSuccess(host)
+			s.created(w, r, h, resp)
+			return roundDone
+		case hostBusy:
+			breakerSuccess(host)
+			reason = reasonBusy
+			busy = true
+			excludedHosts.add(host)
+			hosts = append(hosts[:i], hosts[i+1:]...)
 		case browserFailed:
+			breakerSuccess(host)
+			reason = reasonStartFailed
+			s.startFailures++
+			s.excluded.add(host)
+			excludedHosts.add(host)
 			hosts = append(hosts[:i], hosts[i+1:]...)
 		case seleniumError:
-			excludedHosts.add(h.Net())
+			breakerFailure(host)
+			reason = reasonHostError
+			if breakerEnabled() {
+				busy = true
+			} else {
+				s.excluded.add(host)
+			}
+			excludedHosts.add(host)
 			excludedRegions.add(h.Region)
-			hosts, version, excludedRegions = browsers.find(browser, version, platform, excludedHosts, excludedRegions)
+			var skipped bool
+			hosts, excludedRegions, skipped = s.candidates(excludedHosts, excludedRegions)
+			busy = busy || skipped
 		}
-		errMsg := browserErrMsg(resp)
-		log.Printf("[%d] [%.2fs] [SESSION_FAILED] [%s] [%s] [%s] [%s] [-] [%d] [%s]\n", id, secondsSince(start), user, remote, fmtBrowser(browser, version, platform, labels), h.Net(), count, errMsg)
-		lastHostError = errMsg
-		if len(hosts) == 0 {
-			break loop
+		metricFailures.WithLabelValues(host, reason).Inc()
+		msg := browserErrMsg(resp)
+		s.log("SESSION_FAILED", host, "", true, msg)
+		if msg != "" {
+			s.lastHostError = msg
+		} else if reason == reasonBusy {
+			s.lastHostError = "host is busy"
+		}
+		if reason == reasonStartFailed && maxStartFailures > 0 && s.startFailures >= maxStartFailures {
+			s.lastHostError = fmt.Sprintf("%s (gave up after %d browser start failure(s))", dash(s.lastHostError), s.startFailures)
+			return roundExhausted
 		}
 	}
-	notCreatedMsg := fmt.Sprintf("cannot create session %s on any hosts after %d attempt(s)", fmtBrowser(browser, version, platform, labels), count)
-	if len(lastHostError) > 0 {
-		notCreatedMsg = fmt.Sprintf("%s, last host error was: %s", notCreatedMsg, lastHostError)
+	if busy {
+		if s.attempts == 0 && s.lastHostError == "" {
+			s.lastHostError = "all hosts are temporarily unavailable"
+		}
+		return roundBusy
 	}
-	reply(w, errMsg(notCreatedMsg), http.StatusInternalServerError)
-	log.Printf("[%d] [%.2fs] [SESSION_NOT_CREATED] [%s] [%s] [%s] [-] [-] [-] [-]\n", id, secondsSince(start), user, remote, fmtBrowser(browser, version, platform, labels))
+	return roundExhausted
+}
+
+// created replies with the session ID prefixed by the host hash.
+func (s *newSession) created(w http.ResponseWriter, r *http.Request, h *config.Host, resp map[string]interface{}) {
+	sess, ok := sessionIDOf(resp)
+	if !ok {
+		reply(w, errMsg("protocol error"), http.StatusBadGateway)
+		s.finish(resultBadResponse)
+		s.log("BAD_RESPONSE", h.Net(), "", false, "")
+		return
+	}
+	if _, ok := resp["sessionId"].(string); ok {
+		resp["sessionId"] = h.Sum() + sess
+	} else {
+		valueMap := resp["value"].(map[string]interface{})
+		valueMap["sessionId"] = h.Sum() + sess
+		rewriteCDP(r, valueMap, h.Sum()+sess)
+	}
+	reply(w, resp, http.StatusOK)
+	atomic.AddUint64(&numSessions, 1)
+	metricSessionsCreated.WithLabelValues(h.Net()).Inc()
+	s.finish(resultCreated)
+	s.log("SESSION_CREATED", h.Net(), sess, true, "")
+}
+
+// fail replies that no session was created.
+func (s *newSession) fail(w http.ResponseWriter, code int, reason string, result string) {
+	msg := fmt.Sprintf("cannot create session %s on any hosts after %d attempt(s)", s.fmtBrowser(), s.attempts)
+	if reason != "" {
+		msg = fmt.Sprintf("%s: %s", msg, reason)
+	}
+	if len(s.lastHostError) > 0 {
+		msg = fmt.Sprintf("%s, last host error was: %s", msg, s.lastHostError)
+	}
+	reply(w, errMsg(msg), code)
+	s.finish(result)
+	s.log("SESSION_NOT_CREATED", "", "", false, reason)
 }
 
 func secondsSince(start time.Time) float64 {
-	return time.Now().Sub(start).Seconds()
+	return time.Since(start).Seconds()
 }
 
 func proxy(w http.ResponseWriter, r *http.Request) {
 	id := serial()
+	_, remote := info(r)
+	if len(r.URL.Path) <= tail {
+		log.Printf("[%d] [-] [INVALID_URL] [-] [%s] [%s] [-] [-] [-] [-]\n", id, remote, r.URL.Path)
+		err(w, r)
+		return
+	}
+	sum := r.URL.Path[head:tail]
+	proxyPath := r.URL.Path[:head] + r.URL.Path[tail:]
+	confLock.RLock()
+	h, ok := routes[sum]
+	confLock.RUnlock()
+	if !ok {
+		log.Printf("[%d] [-] [ROUTE_NOT_FOUND] [-] [%s] [%s] [-] [-] [-] [-]\n", id, remote, proxyPath)
+		err(w, r)
+		return
+	}
 	(&httputil.ReverseProxy{
-		Director: func(r *http.Request) {
-			_, remote := info(r)
-			r.URL.Scheme = "http"
-			if len(r.URL.Path) > tail {
-				sum := r.URL.Path[head:tail]
-				proxyPath := r.URL.Path[:head] + r.URL.Path[tail:]
-				confLock.RLock()
-				h, ok := routes[sum]
-				confLock.RUnlock()
-				if ok {
-					if r.Body != nil {
-						if body, err := io.ReadAll(r.Body); err == nil {
-							_ = r.Body.Close()
-							var msg map[string]interface{}
-							if err := json.Unmarshal(body, &msg); err == nil {
-								delete(msg, "sessionId")
-								body, _ = json.Marshal(msg)
-								r.ContentLength = int64(len(body))
-							}
-							r.Body = io.NopCloser(bytes.NewReader(body))
-						}
+		Rewrite: func(pr *httputil.ProxyRequest) {
+			out := pr.Out
+			if out.Body != nil {
+				if body, err := io.ReadAll(out.Body); err == nil {
+					_ = out.Body.Close()
+					var msg map[string]interface{}
+					if err := json.Unmarshal(body, &msg); err == nil {
+						delete(msg, "sessionId")
+						body, _ = json.Marshal(msg)
+						out.ContentLength = int64(len(body))
 					}
-					if h.Scheme != "" {
-						r.URL.Scheme = h.Scheme
-					}
-					r.Host = h.Net()
-					r.URL.Host = h.Net()
-					r.URL.Path = proxyPath
-					fragments := strings.Split(proxyPath, "/")
-					sess := fragments[sessPart]
-					if verbose {
-						log.Printf("[%d] [-] [PROXYING] [-] [%s] [-] [%s] [%s] [-] [%s]\n", id, remote, h.Net(), sess, proxyPath)
-					}
-					if r.Method == http.MethodDelete && len(fragments) == sessPart+1 {
-						log.Printf("[%d] [-] [SESSION_DELETED] [-] [%s] [-] [%s] [%s] [-] [-]\n", id, remote, h.Net(), sess)
-					}
-					return
+					out.Body = io.NopCloser(bytes.NewReader(body))
 				}
-				log.Printf("[%d] [-] [ROUTE_NOT_FOUND] [-] [%s] [%s] [-] [-] [-] [-]\n", id, remote, proxyPath)
-			} else {
-				log.Printf("[%d] [-] [INVALID_URL] [-] [%s] [%s] [-] [-] [-] [-]\n", id, remote, r.URL.Path)
 			}
-			r.URL.Host = listen
-			r.URL.Path = paths.Err
+			setForwardedFor(pr)
+			setHostAuth(out.Header, h)
+			out.URL.Scheme = "http"
+			if h.Scheme != "" {
+				out.URL.Scheme = h.Scheme
+			}
+			out.Host = h.Net()
+			out.URL.Host = h.Net()
+			out.URL.Path = proxyPath
+			out.URL.RawPath = ""
+			fragments := strings.Split(proxyPath, "/")
+			sess := fragments[sessPart]
+			if verbose {
+				log.Printf("[%d] [-] [PROXYING] [-] [%s] [-] [%s] [%s] [-] [%s]\n", id, remote, h.Net(), sess, proxyPath)
+			}
+			if out.Method == http.MethodDelete && len(fragments) == sessPart+1 {
+				log.Printf("[%d] [-] [SESSION_DELETED] [-] [%s] [-] [%s] [%s] [-] [-]\n", id, remote, h.Net(), sess)
+			}
 		},
 		ErrorHandler: defaultErrorHandler(id),
 	}).ServeHTTP(w, r)
+}
+
+// setForwardedFor appends the client address to X-Forwarded-For the same way
+// ReverseProxy.Director did: Rewrite strips the inbound header otherwise.
+func setForwardedFor(pr *httputil.ProxyRequest) {
+	clientIP, _, err := net.SplitHostPort(pr.In.RemoteAddr)
+	if err != nil {
+		return
+	}
+	if prior := pr.In.Header["X-Forwarded-For"]; len(prior) > 0 {
+		clientIP = strings.Join(prior, ", ") + ", " + clientIP
+	}
+	pr.Out.Header.Set("X-Forwarded-For", clientIP)
 }
 
 func ping(w http.ResponseWriter, _ *http.Request) {
@@ -514,7 +734,7 @@ func host(w http.ResponseWriter, r *http.Request) {
 	}
 	log.Printf("[%d] [-] [HOST_INFO_REQUESTED] [%s] [%s] [-] [%s] [%s] [-] [-]\n", id, user, remote, h.Name, sum)
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(Host{Name: h.Name, Port: h.Port, Count: h.Count})
+	_ = json.NewEncoder(w).Encode(config.Host{Name: h.Name, Port: h.Port, Count: h.Count})
 }
 
 func quotaInfo(w http.ResponseWriter, r *http.Request) {
@@ -522,24 +742,37 @@ func quotaInfo(w http.ResponseWriter, r *http.Request) {
 	user, remote := info(r)
 	log.Printf("[%d] [-] [QUOTA_INFO_REQUESTED] [%s] [%s] [-] [-] [-] [-] [-]\n", id, user, remote)
 	confLock.RLock()
-	browsers := quota[user]
+	browsers := withoutCredentials(quota[user].Browsers.Browsers)
 	confLock.RUnlock()
 	w.Header().Set("Content-Type", "application/json")
-	for i := 0; i < len(browsers.Browsers.Browsers); i++ {
-		browser := &browsers.Browsers.Browsers[i]
-		for j := 0; j < len(browser.Versions); j++ {
-			version := &browser.Versions[j]
-			for k := 0; k < len(version.Regions); k++ {
-				region := &version.Regions[k]
-				for l := 0; l < len(region.Hosts); l++ {
-					host := &region.Hosts[l]
-					host.Username = ""
-					host.Password = ""
-				}
-			}
-		}
+	_ = json.NewEncoder(w).Encode(browsers)
+}
+
+// withoutCredentials returns a deep copy of browsers with host credentials
+// removed. Loaded quota shares host structs with routes, so it must never be
+// modified in place.
+func withoutCredentials(browsers []config.Browser) []config.Browser {
+	if browsers == nil {
+		return nil
 	}
-	_ = json.NewEncoder(w).Encode(browsers.Browsers.Browsers)
+	ret := make([]config.Browser, len(browsers))
+	for i, b := range browsers {
+		b.Versions = append([]config.Version(nil), b.Versions...)
+		for j, v := range b.Versions {
+			v.Regions = append([]config.Region(nil), v.Regions...)
+			for k, r := range v.Regions {
+				r.Hosts = append(config.Hosts(nil), r.Hosts...)
+				for l := range r.Hosts {
+					r.Hosts[l].Username = ""
+					r.Hosts[l].Password = ""
+				}
+				v.Regions[k] = r
+			}
+			b.Versions[j] = v
+		}
+		ret[i] = b
+	}
+	return ret
 }
 
 func postOnly(handler http.HandlerFunc) http.HandlerFunc {
@@ -552,22 +785,7 @@ func postOnly(handler http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-func withCloseNotifier(handler http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		ctx, cancel := context.WithCancel(r.Context())
-		go func() {
-			handler(w, r.WithContext(ctx))
-			cancel()
-		}()
-		select {
-		case <-r.Context().Done():
-			cancel()
-		case <-ctx.Done():
-		}
-	}
-}
-
-func readConfig(fn string, browsers *Browsers) error {
+func readConfig(fn string, browsers *config.Browsers) error {
 	file, err := os.ReadFile(fn)
 	if err != nil {
 		return fmt.Errorf("error reading configuration file %s: %v", fn, err)
@@ -578,8 +796,8 @@ func readConfig(fn string, browsers *Browsers) error {
 	return nil
 }
 
-func appendRoutes(routes Routes, config *Browsers) Routes {
-	for _, b := range config.Browsers {
+func appendRoutes(routes Routes, browsers *config.Browsers) Routes {
+	for _, b := range browsers.Browsers {
 		for _, v := range b.Versions {
 			for _, r := range v.Regions {
 				for i, h := range r.Hosts {
@@ -594,7 +812,7 @@ func appendRoutes(routes Routes, config *Browsers) Routes {
 	return routes
 }
 
-func createVNCInfo(h Host) *VncInfo {
+func createVNCInfo(h config.Host) *config.VncInfo {
 	vncURL := h.VNC
 	if vncURL != "" {
 		u, err := url.Parse(vncURL)
@@ -602,25 +820,31 @@ func createVNCInfo(h Host) *VncInfo {
 			log.Printf("[-] [-] [INVALID_HOST_VNC_URL] [-] [-] [%s] [%s] [-] [-] [-]\n", vncURL, fmt.Sprintf("%s:%d", h.Name, h.Port))
 			return nil
 		}
-		if u.Scheme != vncScheme && u.Scheme != wsScheme {
+		if u.Scheme != vncScheme && u.Scheme != wsScheme && u.Scheme != wssScheme {
 			log.Printf("[-] [-] [UNSUPPORTED_HOST_VNC_SCHEME] [-] [-] [%s] [%s] [-] [-] [-]\n", vncURL, fmt.Sprintf("%s:%d", h.Name, h.Port))
 			return nil
 		}
-		vncInfo := VncInfo{
+		vncInfo := config.VncInfo{
 			Scheme: u.Scheme,
 			Path:   u.Path,
 		}
-		vncInfo.Scheme = u.Scheme
-		vncInfo.Host, vncInfo.Port, _ = net.SplitHostPort(u.Host)
+		vncInfo.Host, vncInfo.Port = u.Hostname(), u.Port()
+		if vncInfo.Port == "" {
+			vncInfo.Port = map[string]string{vncScheme: defaultVNCPort, wsScheme: "80", wssScheme: "443"}[u.Scheme]
+		}
 		return &vncInfo
 	}
 	return nil
 }
 
 func requireBasicAuth(authenticator *auth.BasicAuth, handler func(http.ResponseWriter, *http.Request)) func(http.ResponseWriter, *http.Request) {
-	return authenticator.Wrap(func(w http.ResponseWriter, r *auth.AuthenticatedRequest) {
-		handler(w, &r.Request)
-	})
+	return func(w http.ResponseWriter, r *http.Request) {
+		if authenticator.CheckAuth(r) == "" {
+			authenticator.RequireAuth(w, r)
+			return
+		}
+		handler(w, r)
+	}
 }
 
 // WithSuitableAuthentication handles basic authentication and guest quota processing
@@ -687,8 +911,8 @@ func vnc(wsconn *websocket.Conn) {
 		switch scheme {
 		case vncScheme:
 			proxyVNC(id, wsconn, sessionID, host, port)
-		case wsScheme:
-			proxyWebSockets(id, wsconn, sessionID, host, port, path)
+		case wsScheme, wssScheme:
+			proxyWebSockets(id, wsconn, h, sessionID, scheme, host, port, path)
 		default:
 			{
 				log.Printf("[%d] [-] [UNSUPPORTED_HOST_VNC_SCHEME] [-] [-] [%s] [-] [-] [-] [-]\n", id, scheme)
@@ -708,11 +932,16 @@ func proxyVNC(id uint64, wsconn *websocket.Conn, sessionID string, host string, 
 	proxyConn(id, wsconn, conn, err, sessionID, address)
 }
 
-func proxyWebSockets(id uint64, wsconn *websocket.Conn, sessionID string, host string, port string, path string) {
+func proxyWebSockets(id uint64, wsconn *websocket.Conn, h *config.Host, sessionID string, scheme string, host string, port string, path string) {
 	origin := "http://localhost/"
-	u := fmt.Sprintf("ws://%s:%s%s/%s", host, port, path, sessionID)
-	//TODO: consider context from wsconn
-	conn, err := websocket.Dial(u, "", origin)
+	u := fmt.Sprintf("%s://%s%s/%s", scheme, net.JoinHostPort(host, port), path, sessionID)
+	cfg, err := websocket.NewConfig(u, origin)
+	if err != nil {
+		proxyConn(id, wsconn, nil, err, sessionID, u)
+		return
+	}
+	setHostAuth(cfg.Header, h)
+	conn, err := cfg.DialContext(wsconn.Request().Context())
 	proxyConn(id, wsconn, conn, err, sessionID, u)
 }
 
@@ -781,14 +1010,18 @@ func proxyStatic(w http.ResponseWriter, r *http.Request, route string, invalidUr
 	remainder := path[tail:]
 	if ok {
 		(&httputil.ReverseProxy{
-			Director: func(r *http.Request) {
-				r.URL.Scheme = "http"
+			Rewrite: func(pr *httputil.ProxyRequest) {
+				setForwardedFor(pr)
+				setHostAuth(pr.Out.Header, h)
+				out := pr.Out
+				out.URL.Scheme = "http"
 				if h.Scheme != "" {
-					r.URL.Scheme = h.Scheme
+					out.URL.Scheme = h.Scheme
 				}
-				r.URL.Host = h.Net()
-				r.URL.Path = pathProvider(remainder)
-				log.Printf("[%d] [-] [%s] [%s] [%s] [%s] [-] [%s] [-] [-]\n", id, proxyingMessage, user, remote, r.URL, remainder)
+				out.URL.Host = h.Net()
+				out.URL.Path = pathProvider(remainder)
+				out.URL.RawPath = ""
+				log.Printf("[%d] [-] [%s] [%s] [%s] [%s] [-] [%s] [-] [-]\n", id, proxyingMessage, user, remote, out.URL, remainder)
 			},
 			ErrorHandler: defaultErrorHandler(id),
 		}).ServeHTTP(w, r)
@@ -817,7 +1050,7 @@ func mux() http.Handler {
 	mux.HandleFunc(paths.Err, err)
 	mux.HandleFunc(paths.Host, WithSuitableAuthentication(authenticator, host))
 	mux.HandleFunc(paths.Quota, WithSuitableAuthentication(authenticator, quotaInfo))
-	mux.HandleFunc(paths.Route, withCloseNotifier(WithSuitableAuthentication(authenticator, postOnly(route))))
+	mux.HandleFunc(paths.Route, WithSuitableAuthentication(authenticator, postOnly(route)))
 	mux.HandleFunc(paths.Proxy, proxy)
 	mux.Handle(paths.VNC, websocket.Handler(vnc))
 	mux.HandleFunc(paths.Video, WithSuitableAuthentication(authenticator, video))
@@ -826,5 +1059,6 @@ func mux() http.Handler {
 	mux.HandleFunc(paths.Clipboard, WithSuitableAuthentication(authenticator, clipboard))
 	mux.HandleFunc(paths.Devtools, devtools)
 	mux.Handle(paths.Pprof, http.DefaultServeMux)
+	mux.Handle(paths.Metrics, promhttp.Handler())
 	return mux
 }

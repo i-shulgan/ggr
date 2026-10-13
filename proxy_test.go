@@ -19,17 +19,12 @@ import (
 	"strings"
 
 	"github.com/abbot/go-http-auth"
-	. "github.com/aerokube/ggr/config"
+	"github.com/aerokube/ggr/config"
 	assert "github.com/stretchr/testify/require"
 	"golang.org/x/net/websocket"
 	"os"
 	"path/filepath"
 )
-
-var _ = func() bool {
-	testing.Init()
-	return true
-}()
 
 var (
 	srv  *httptest.Server
@@ -144,7 +139,7 @@ func TestGetHostUnauthorized(t *testing.T) {
 }
 
 func TestGetExistingHost(t *testing.T) {
-	correctHost := Host{Name: "example.com", Port: 4444, Count: 1}
+	correctHost := config.Host{Name: "example.com", Port: 4444, Count: 1}
 	host := testGetHost(t, correctHost.Sum()+"123", http.StatusOK)
 	assert.NotNil(t, host)
 	assert.Equal(t, *host, correctHost)
@@ -159,16 +154,16 @@ func TestGetHostBadSessionId(t *testing.T) {
 	testGetHost(t, "bad-session-id", http.StatusBadRequest)
 }
 
-func testGetHost(t *testing.T, sessionID string, statusCode int) *Host {
+func testGetHost(t *testing.T, sessionID string, statusCode int) *config.Host {
 
 	test.Lock()
 	defer test.Unlock()
 
-	browsers := Browsers{Browsers: []Browser{
-		{Name: "browser", DefaultVersion: "1.0", Versions: []Version{
-			{Number: "1.0", Regions: []Region{
-				{Hosts: Hosts{
-					Host{Name: "example.com", Port: 4444, Count: 1, Username: "test", Password: "test"},
+	browsers := config.Browsers{Browsers: []config.Browser{
+		{Name: "browser", DefaultVersion: "1.0", Versions: []config.Version{
+			{Number: "1.0", Regions: []config.Region{
+				{Hosts: config.Hosts{
+					config.Host{Name: "example.com", Port: 4444, Count: 1, Username: "test", Password: "test"},
 				}},
 			}},
 		}}}}
@@ -180,7 +175,7 @@ func testGetHost(t *testing.T, sessionID string, statusCode int) *Host {
 	if statusCode != http.StatusOK {
 		return nil
 	}
-	var host Host
+	var host config.Host
 	_ = json.NewDecoder(rsp.Body).Decode(&host)
 	return &host
 }
@@ -194,11 +189,11 @@ func TestGetQuotaInfoUnauthorized(t *testing.T) {
 func TestGetQuotaInfo(t *testing.T) {
 	test.Lock()
 	defer test.Unlock()
-	browsers := Browsers{Browsers: []Browser{
-		{Name: "browser", DefaultVersion: "1.0", Versions: []Version{
-			{Number: "1.0", Regions: []Region{
-				{Hosts: Hosts{
-					Host{Name: "example.com", Port: 4444, Count: 1, Username: "test", Password: "test"},
+	browsers := config.Browsers{Browsers: []config.Browser{
+		{Name: "browser", DefaultVersion: "1.0", Versions: []config.Version{
+			{Number: "1.0", Regions: []config.Region{
+				{Hosts: config.Hosts{
+					config.Host{Name: "example.com", Port: 4444, Count: 1, Username: "test", Password: "test"},
 				}},
 			}},
 		}}}}
@@ -208,19 +203,27 @@ func TestGetQuotaInfo(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, rsp.StatusCode, http.StatusOK)
 
-	var fetchedBrowsers []Browser
+	var fetchedBrowsers []config.Browser
 	err = json.NewDecoder(rsp.Body).Decode(&fetchedBrowsers)
 	assert.NoError(t, err)
 
-	browsersWithoutCredentials := []Browser{
-		{Name: "browser", DefaultVersion: "1.0", Versions: []Version{
-			{Number: "1.0", Regions: []Region{
-				{Hosts: Hosts{
-					Host{Name: "example.com", Port: 4444, Count: 1, Username: "", Password: ""},
+	browsersWithoutCredentials := []config.Browser{
+		{Name: "browser", DefaultVersion: "1.0", Versions: []config.Version{
+			{Number: "1.0", Regions: []config.Region{
+				{Hosts: config.Hosts{
+					config.Host{Name: "example.com", Port: 4444, Count: 1, Username: "", Password: ""},
 				}},
 			}},
 		}}}
 	assert.Equal(t, fetchedBrowsers, browsersWithoutCredentials)
+
+	confLock.RLock()
+	h := quota[user].Browsers.Browsers[0].Versions[0].Regions[0].Hosts[0]
+	routed := routes[h.Sum()]
+	confLock.RUnlock()
+	assert.Equal(t, "test", h.Username, "/quota must not wipe credentials in loaded quota")
+	assert.Equal(t, "test", h.Password)
+	assert.Equal(t, "test", routed.Username, "/quota must not wipe credentials used for routing")
 }
 
 func TestProxyScreenVNCProtocol(t *testing.T) {
@@ -232,12 +235,12 @@ func TestProxyScreenVNCProtocol(t *testing.T) {
 	server := testTCPServer(testData)
 	defer server.Close()
 
-	vncHost := Host{Name: "example.com", Port: 4444, Count: 1, VNC: fmt.Sprintf("vnc://%s", server.Addr().String())}
+	vncHost := config.Host{Name: "example.com", Port: 4444, Count: 1, VNC: fmt.Sprintf("vnc://%s", server.Addr().String())}
 
-	browsers := Browsers{Browsers: []Browser{
-		{Name: "browser", DefaultVersion: "1.0", Versions: []Version{
-			{Number: "1.0", Regions: []Region{
-				{Hosts: Hosts{
+	browsers := config.Browsers{Browsers: []config.Browser{
+		{Name: "browser", DefaultVersion: "1.0", Versions: []config.Version{
+			{Number: "1.0", Regions: []config.Region{
+				{Hosts: config.Hosts{
 					vncHost,
 				}},
 			}},
@@ -247,7 +250,7 @@ func TestProxyScreenVNCProtocol(t *testing.T) {
 	testDataReceived(vncHost, "vnc", testData, t)
 }
 
-func testDataReceived(host Host, api string, correctData string, t *testing.T) {
+func testDataReceived(host config.Host, api string, correctData string, t *testing.T) {
 	sessionID := host.Sum() + "123"
 
 	origin := "http://localhost/"
@@ -291,12 +294,12 @@ func TestProxyScreenWebSocketsProtocol(t *testing.T) {
 	wsServer := httptest.NewServer(mux)
 	defer wsServer.Close()
 
-	wsHost := Host{Name: "example.com", Port: 4444, Count: 1, VNC: fmt.Sprintf("ws://%s/vnc", wsServer.Listener.Addr().String())}
+	wsHost := config.Host{Name: "example.com", Port: 4444, Count: 1, VNC: fmt.Sprintf("ws://%s/vnc", wsServer.Listener.Addr().String())}
 
-	browsers := Browsers{Browsers: []Browser{
-		{Name: "browser", DefaultVersion: "1.0", Versions: []Version{
-			{Number: "1.0", Regions: []Region{
-				{Hosts: Hosts{
+	browsers := config.Browsers{Browsers: []config.Browser{
+		{Name: "browser", DefaultVersion: "1.0", Versions: []config.Version{
+			{Number: "1.0", Regions: []config.Region{
+				{Hosts: config.Hosts{
 					wsHost,
 				}},
 			}},
@@ -322,12 +325,12 @@ func TestProxyDevtools(t *testing.T) {
 
 	h, p, _ := net.SplitHostPort(wsServer.Listener.Addr().String())
 	intPort, _ := strconv.Atoi(p)
-	wsHost := Host{Name: h, Port: intPort, Count: 1}
+	wsHost := config.Host{Name: h, Port: intPort, Count: 1}
 
-	browsers := Browsers{Browsers: []Browser{
-		{Name: "browser", DefaultVersion: "1.0", Versions: []Version{
-			{Number: "1.0", Regions: []Region{
-				{Hosts: Hosts{
+	browsers := config.Browsers{Browsers: []config.Browser{
+		{Name: "browser", DefaultVersion: "1.0", Versions: []config.Version{
+			{Number: "1.0", Regions: []config.Region{
+				{Hosts: config.Hosts{
 					wsHost,
 				}},
 			}},
@@ -388,12 +391,12 @@ func TestProxyVideoFileBadGateway(t *testing.T) {
 	test.Lock()
 	defer test.Unlock()
 
-	node := Host{Name: "missing-host.example.com", Port: 4444, Count: 1}
+	node := config.Host{Name: "missing-host.example.com", Port: 4444, Count: 1}
 
-	browsers := Browsers{Browsers: []Browser{
-		{Name: "browser", DefaultVersion: "1.0", Versions: []Version{
-			{Number: "1.0", Regions: []Region{
-				{Hosts: Hosts{
+	browsers := config.Browsers{Browsers: []config.Browser{
+		{Name: "browser", DefaultVersion: "1.0", Versions: []config.Version{
+			{Number: "1.0", Regions: []config.Region{
+				{Hosts: config.Hosts{
 					node,
 				}},
 			}},
@@ -414,12 +417,12 @@ func prepareMockFileServer(path string) (*httptest.Server, string) {
 	fileServer := httptest.NewServer(mux)
 
 	host, port := hostportnum(fileServer.URL)
-	node := Host{Name: host, Port: port, Count: 1}
+	node := config.Host{Name: host, Port: port, Count: 1}
 
-	browsers := Browsers{Browsers: []Browser{
-		{Name: "browser", DefaultVersion: "1.0", Versions: []Version{
-			{Number: "1.0", Regions: []Region{
-				{Hosts: Hosts{
+	browsers := config.Browsers{Browsers: []config.Browser{
+		{Name: "browser", DefaultVersion: "1.0", Versions: []config.Version{
+			{Number: "1.0", Regions: []config.Region{
+				{Hosts: config.Hosts{
 					node,
 				}},
 			}},
@@ -609,11 +612,11 @@ func TestCreateSessionNoHosts(t *testing.T) {
 	test.Lock()
 	defer test.Unlock()
 
-	browsers := Browsers{Browsers: []Browser{
-		{Name: "browser", DefaultVersion: "1.0", Versions: []Version{
-			{Number: "1.0", Regions: []Region{
-				{Hosts: Hosts{
-					Host{Name: "browser-1.0", Port: 4444, Count: 0},
+	browsers := config.Browsers{Browsers: []config.Browser{
+		{Name: "browser", DefaultVersion: "1.0", Versions: []config.Version{
+			{Number: "1.0", Regions: []config.Region{
+				{Hosts: config.Hosts{
+					config.Host{Name: "browser-1.0", Port: 4444, Count: 0},
 				}},
 			}},
 		}}}}
@@ -623,18 +626,18 @@ func TestCreateSessionNoHosts(t *testing.T) {
 
 	assert.NoError(t, err)
 	assert.Equal(t, rsp.StatusCode, http.StatusInternalServerError)
-	assert.Equal(t, message(rsp), "cannot create session browser-1.0 on any hosts after 1 attempt(s)")
+	assert.Equal(t, message(rsp), "cannot create session browser-1.0 on any hosts after 0 attempt(s)")
 }
 
 func TestCreateSessionHostDown(t *testing.T) {
 	test.Lock()
 	defer test.Unlock()
 
-	browsers := Browsers{Browsers: []Browser{
-		{Name: "browser", DefaultVersion: "1.0", Versions: []Version{
-			{Number: "1.0", Regions: []Region{
-				{Hosts: Hosts{
-					Host{Name: "browser-1.0", Port: 4444, Count: 1},
+	browsers := config.Browsers{Browsers: []config.Browser{
+		{Name: "browser", DefaultVersion: "1.0", Versions: []config.Version{
+			{Number: "1.0", Regions: []config.Region{
+				{Hosts: config.Hosts{
+					config.Host{Name: "browser-1.0", Port: 4444, Count: 1},
 				}},
 			}},
 		}}}}
@@ -668,18 +671,18 @@ func TestStartSession(t *testing.T) {
 		_, _ = w.Write([]byte(`{"sessionId":"123"}`))
 	}))
 
-	browsersProvider := func(node Host) Browsers {
-		return Browsers{Browsers: []Browser{
-			{Name: "browser", DefaultVersion: "1.0", Versions: []Version{
-				{Number: "1.0", Regions: []Region{
-					{Hosts: Hosts{
+	browsersProvider := func(node config.Host) config.Browsers {
+		return config.Browsers{Browsers: []config.Browser{
+			{Name: "browser", DefaultVersion: "1.0", Versions: []config.Version{
+				{Number: "1.0", Regions: []config.Region{
+					{Hosts: config.Hosts{
 						node,
 					}},
 				}},
 			}},
-			{Name: "someDevice", DefaultVersion: "2.0", Versions: []Version{
-				{Number: "2.0", Regions: []Region{
-					{Hosts: Hosts{
+			{Name: "someDevice", DefaultVersion: "2.0", Versions: []config.Version{
+				{Number: "2.0", Regions: []config.Region{
+					{Hosts: config.Hosts{
 						node,
 					}},
 				}},
@@ -696,11 +699,11 @@ func TestStartSessionWithLocationHeader(t *testing.T) {
 		w.Header().Set("Location", "http://host.example.com/session/123")
 	}))
 
-	browsersProvider := func(node Host) Browsers {
-		return Browsers{Browsers: []Browser{
-			{Name: "browser", DefaultVersion: "1.0", Versions: []Version{
-				{Number: "1.0", Regions: []Region{
-					{Hosts: Hosts{
+	browsersProvider := func(node config.Host) config.Browsers {
+		return config.Browsers{Browsers: []config.Browser{
+			{Name: "browser", DefaultVersion: "1.0", Versions: []config.Version{
+				{Number: "1.0", Regions: []config.Region{
+					{Hosts: config.Hosts{
 						node,
 					}},
 				}},
@@ -710,12 +713,12 @@ func TestStartSessionWithLocationHeader(t *testing.T) {
 	testStartSession(t, mux, browsersProvider, "browser", "1.0")
 }
 
-func testStartSessionCustomCaps(t *testing.T, mux *http.ServeMux, browsersProvider func(Host) Browsers, capsJSON string) {
+func testStartSessionCustomCaps(t *testing.T, mux *http.ServeMux, browsersProvider func(config.Host) config.Browsers, capsJSON string) {
 	selenium := httptest.NewServer(mux)
 	defer selenium.Close()
 
 	host, port := hostportnum(selenium.URL)
-	node := Host{Name: host, Port: port, Count: 1}
+	node := config.Host{Name: host, Port: port, Count: 1}
 	browsers := browsersProvider(node)
 
 	test.Lock()
@@ -736,7 +739,7 @@ func testStartSessionCustomCaps(t *testing.T, mux *http.ServeMux, browsersProvid
 	assert.Equal(t, sess["sessionId"], fmt.Sprintf("%s123", node.Sum()))
 }
 
-func testStartSession(t *testing.T, mux *http.ServeMux, browsersProvider func(Host) Browsers, browserName string, version string) {
+func testStartSession(t *testing.T, mux *http.ServeMux, browsersProvider func(config.Host) config.Browsers, browserName string, version string) {
 	testStartSessionCustomCaps(t, mux, browsersProvider, fmt.Sprintf(`{"desiredCapabilities":{"browserName":"%s", "version":"%s", "labels": {"one": "value1", "two": null, "three": false}}}`, browserName, version))
 }
 
@@ -746,11 +749,11 @@ func TestStartSessionWithJsonSpecChars(t *testing.T) {
 		_, _ = w.Write([]byte(`{"sessionId":"123"}`))
 	}))
 
-	browsersProvider := func(node Host) Browsers {
-		return Browsers{Browsers: []Browser{
-			{Name: "{browser}", DefaultVersion: "1.0", Versions: []Version{
-				{Number: "1.0", Regions: []Region{
-					{Hosts: Hosts{
+	browsersProvider := func(node config.Host) config.Browsers {
+		return config.Browsers{Browsers: []config.Browser{
+			{Name: "{browser}", DefaultVersion: "1.0", Versions: []config.Version{
+				{Number: "1.0", Regions: []config.Region{
+					{Hosts: config.Hosts{
 						node,
 					}},
 				}},
@@ -771,13 +774,13 @@ func TestStartSessionWithOverriddenBasicAuth(t *testing.T) {
 		}
 	}))
 
-	browsersProvider := func(node Host) Browsers {
+	browsersProvider := func(node config.Host) config.Browsers {
 		node.Username = "test"
 		node.Password = "test-password"
-		return Browsers{Browsers: []Browser{
-			{Name: "browser", DefaultVersion: "1.0", Versions: []Version{
-				{Number: "1.0", Regions: []Region{
-					{Hosts: Hosts{
+		return config.Browsers{Browsers: []config.Browser{
+			{Name: "browser", DefaultVersion: "1.0", Versions: []config.Version{
+				{Number: "1.0", Regions: []config.Region{
+					{Hosts: config.Hosts{
 						node,
 					}},
 				}},
@@ -802,15 +805,15 @@ func TestStartSessionWithPrefixVersion(t *testing.T) {
 	defer selenium.Close()
 
 	host, port := hostportnum(selenium.URL)
-	node := Host{Name: host, Port: port, Count: 1}
+	node := config.Host{Name: host, Port: port, Count: 1}
 
 	test.Lock()
 	defer test.Unlock()
 
-	browsers := Browsers{Browsers: []Browser{
-		{Name: "browser", DefaultVersion: "1.0", Versions: []Version{
-			{Number: "1.0", Regions: []Region{
-				{Hosts: Hosts{
+	browsers := config.Browsers{Browsers: []config.Browser{
+		{Name: "browser", DefaultVersion: "1.0", Versions: []config.Version{
+			{Number: "1.0", Regions: []config.Region{
+				{Hosts: config.Hosts{
 					node,
 				}},
 			}},
@@ -860,20 +863,20 @@ func TestStartSessionWithDefaultVersion(t *testing.T) {
 	defer selenium.Close()
 
 	host, port := hostportnum(selenium.URL)
-	node := Host{Name: host, Port: port, Count: 1}
+	node := config.Host{Name: host, Port: port, Count: 1}
 
 	test.Lock()
 	defer test.Unlock()
 
-	browsers := Browsers{Browsers: []Browser{
-		{Name: "browser", DefaultVersion: "2.0", Versions: []Version{
-			{Number: "1.0", Regions: []Region{
-				{Hosts: Hosts{
+	browsers := config.Browsers{Browsers: []config.Browser{
+		{Name: "browser", DefaultVersion: "2.0", Versions: []config.Version{
+			{Number: "1.0", Regions: []config.Region{
+				{Hosts: config.Hosts{
 					node,
 				}},
 			}},
-			{Number: "2.0", Regions: []Region{
-				{Hosts: Hosts{
+			{Number: "2.0", Regions: []config.Region{
+				{Hosts: config.Hosts{
 					node,
 				}},
 			}},
@@ -905,20 +908,20 @@ func TestStartSessionWithDefaultVersionW3C(t *testing.T) {
 	defer selenium.Close()
 
 	host, port := hostportnum(selenium.URL)
-	node := Host{Name: host, Port: port, Count: 1}
+	node := config.Host{Name: host, Port: port, Count: 1}
 
 	test.Lock()
 	defer test.Unlock()
 
-	browsers := Browsers{Browsers: []Browser{
-		{Name: "browser", DefaultVersion: "2.0", Versions: []Version{
-			{Number: "1.0", Regions: []Region{
-				{Hosts: Hosts{
+	browsers := config.Browsers{Browsers: []config.Browser{
+		{Name: "browser", DefaultVersion: "2.0", Versions: []config.Version{
+			{Number: "1.0", Regions: []config.Region{
+				{Hosts: config.Hosts{
 					node,
 				}},
 			}},
-			{Number: "2.0", Regions: []Region{
-				{Hosts: Hosts{
+			{Number: "2.0", Regions: []config.Region{
+				{Hosts: config.Hosts{
 					node,
 				}},
 			}},
@@ -941,15 +944,15 @@ func TestClientClosedConnection(t *testing.T) {
 	defer selenium.Close()
 
 	host, port := hostportnum(selenium.URL)
-	node := Host{Name: host, Port: port, Count: 1}
+	node := config.Host{Name: host, Port: port, Count: 1}
 
 	test.Lock()
 	defer test.Unlock()
 
-	browsers := Browsers{Browsers: []Browser{
-		{Name: "browser", DefaultVersion: "1.0", Versions: []Version{
-			{Number: "1.0", Regions: []Region{
-				{Hosts: Hosts{
+	browsers := config.Browsers{Browsers: []config.Browser{
+		{Name: "browser", DefaultVersion: "1.0", Versions: []config.Version{
+			{Number: "1.0", Regions: []config.Region{
+				{Hosts: config.Hosts{
 					node,
 				}},
 			}},
@@ -980,15 +983,15 @@ func TestStartSessionFail(t *testing.T) {
 	defer selenium.Close()
 
 	host, port := hostportnum(selenium.URL)
-	node := Host{Name: host, Port: port, Count: 1}
+	node := config.Host{Name: host, Port: port, Count: 1}
 
 	test.Lock()
 	defer test.Unlock()
 
-	browsers := Browsers{Browsers: []Browser{
-		{Name: "browser", DefaultVersion: "1.0", Versions: []Version{
-			{Number: "1.0", Regions: []Region{
-				{Hosts: Hosts{
+	browsers := config.Browsers{Browsers: []config.Browser{
+		{Name: "browser", DefaultVersion: "1.0", Versions: []config.Version{
+			{Number: "1.0", Regions: []config.Region{
+				{Hosts: config.Hosts{
 					node, node, node, node, node,
 				}},
 			}},
@@ -1003,7 +1006,7 @@ func TestStartSessionFail(t *testing.T) {
 }
 
 func TestStartSessionFailMultiRegion(t *testing.T) {
-	node := []Host{
+	node := []config.Host{
 		{Name: "localhost", Port: 9991, Count: 1},
 		{Name: "localhost", Port: 9992, Count: 1},
 		{Name: "localhost", Port: 9993, Count: 1},
@@ -1018,24 +1021,24 @@ func TestStartSessionFailMultiRegion(t *testing.T) {
 	test.Lock()
 	defer test.Unlock()
 
-	browsers := Browsers{Browsers: []Browser{
-		{Name: "browser", DefaultVersion: "1.0", Versions: []Version{
-			{Number: "1.0", Regions: []Region{
+	browsers := config.Browsers{Browsers: []config.Browser{
+		{Name: "browser", DefaultVersion: "1.0", Versions: []config.Version{
+			{Number: "1.0", Regions: []config.Region{
 				{
 					Name: "us-west-1",
-					Hosts: Hosts{
+					Hosts: config.Hosts{
 						node[0], node[1], node[2],
 					},
 				},
 				{
 					Name: "us-west-2",
-					Hosts: Hosts{
+					Hosts: config.Hosts{
 						node[3], node[4], node[5],
 					},
 				},
 				{
 					Name: "us-west-3",
-					Hosts: Hosts{
+					Hosts: config.Hosts{
 						node[6], node[7], node[8],
 					},
 				},
@@ -1060,15 +1063,15 @@ func TestStartSessionBrowserFail(t *testing.T) {
 	defer selenium.Close()
 
 	host, port := hostportnum(selenium.URL)
-	node := Host{Name: host, Port: port, Count: 1}
+	node := config.Host{Name: host, Port: port, Count: 1}
 
 	test.Lock()
 	defer test.Unlock()
 
-	browsers := Browsers{Browsers: []Browser{
-		{Name: "browser", DefaultVersion: "1.0", Versions: []Version{
-			{Number: "1.0", Regions: []Region{
-				{Hosts: Hosts{
+	browsers := config.Browsers{Browsers: []config.Browser{
+		{Name: "browser", DefaultVersion: "1.0", Versions: []config.Version{
+			{Number: "1.0", Regions: []config.Region{
+				{Hosts: config.Hosts{
 					node, node, node, node, node,
 				}},
 			}},
@@ -1092,15 +1095,15 @@ func TestStartSessionBrowserFailUnknownError(t *testing.T) {
 	defer selenium.Close()
 
 	host, port := hostportnum(selenium.URL)
-	node := Host{Name: host, Port: port, Count: 1}
+	node := config.Host{Name: host, Port: port, Count: 1}
 
 	test.Lock()
 	defer test.Unlock()
 
-	browsers := Browsers{Browsers: []Browser{
-		{Name: "browser", DefaultVersion: "1.0", Versions: []Version{
-			{Number: "1.0", Regions: []Region{
-				{Hosts: Hosts{
+	browsers := config.Browsers{Browsers: []config.Browser{
+		{Name: "browser", DefaultVersion: "1.0", Versions: []config.Version{
+			{Number: "1.0", Regions: []config.Region{
+				{Hosts: config.Hosts{
 					node,
 				}},
 			}},
@@ -1124,15 +1127,15 @@ func TestStartSessionBrowserFailWrongValue(t *testing.T) {
 	defer selenium.Close()
 
 	host, port := hostportnum(selenium.URL)
-	node := Host{Name: host, Port: port, Count: 1}
+	node := config.Host{Name: host, Port: port, Count: 1}
 
 	test.Lock()
 	defer test.Unlock()
 
-	browsers := Browsers{Browsers: []Browser{
-		{Name: "browser", DefaultVersion: "1.0", Versions: []Version{
-			{Number: "1.0", Regions: []Region{
-				{Hosts: Hosts{
+	browsers := config.Browsers{Browsers: []config.Browser{
+		{Name: "browser", DefaultVersion: "1.0", Versions: []config.Version{
+			{Number: "1.0", Regions: []config.Region{
+				{Hosts: config.Hosts{
 					node,
 				}},
 			}},
@@ -1156,15 +1159,15 @@ func TestStartSessionBrowserFailWrongMsg(t *testing.T) {
 	defer selenium.Close()
 
 	host, port := hostportnum(selenium.URL)
-	node := Host{Name: host, Port: port, Count: 1}
+	node := config.Host{Name: host, Port: port, Count: 1}
 
 	test.Lock()
 	defer test.Unlock()
 
-	browsers := Browsers{Browsers: []Browser{
-		{Name: "browser", DefaultVersion: "1.0", Versions: []Version{
-			{Number: "1.0", Regions: []Region{
-				{Hosts: Hosts{
+	browsers := config.Browsers{Browsers: []config.Browser{
+		{Name: "browser", DefaultVersion: "1.0", Versions: []config.Version{
+			{Number: "1.0", Regions: []config.Region{
+				{Hosts: config.Hosts{
 					node,
 				}},
 			}},
@@ -1188,15 +1191,15 @@ func TestStartSessionFailJSONWireProtocol(t *testing.T) {
 	defer selenium.Close()
 
 	host, port := hostportnum(selenium.URL)
-	node := Host{Name: host, Port: port, Count: 1}
+	node := config.Host{Name: host, Port: port, Count: 1}
 
 	test.Lock()
 	defer test.Unlock()
 
-	browsers := Browsers{Browsers: []Browser{
-		{Name: "browser", DefaultVersion: "1.0", Versions: []Version{
-			{Number: "1.0", Regions: []Region{
-				{Hosts: Hosts{
+	browsers := config.Browsers{Browsers: []config.Browser{
+		{Name: "browser", DefaultVersion: "1.0", Versions: []config.Version{
+			{Number: "1.0", Regions: []config.Region{
+				{Hosts: config.Hosts{
 					node,
 				}},
 			}},
@@ -1219,15 +1222,15 @@ func TestStartSessionFailJSONWireProtocolNoSessionID(t *testing.T) {
 	defer selenium.Close()
 
 	host, port := hostportnum(selenium.URL)
-	node := Host{Name: host, Port: port, Count: 1}
+	node := config.Host{Name: host, Port: port, Count: 1}
 
 	test.Lock()
 	defer test.Unlock()
 
-	browsers := Browsers{Browsers: []Browser{
-		{Name: "browser", DefaultVersion: "1.0", Versions: []Version{
-			{Number: "1.0", Regions: []Region{
-				{Hosts: Hosts{
+	browsers := config.Browsers{Browsers: []config.Browser{
+		{Name: "browser", DefaultVersion: "1.0", Versions: []config.Version{
+			{Number: "1.0", Regions: []config.Region{
+				{Hosts: config.Hosts{
 					node,
 				}},
 			}},
@@ -1250,15 +1253,15 @@ func TestStartSessionFailJSONWireProtocolWrongType(t *testing.T) {
 	defer selenium.Close()
 
 	host, port := hostportnum(selenium.URL)
-	node := Host{Name: host, Port: port, Count: 1}
+	node := config.Host{Name: host, Port: port, Count: 1}
 
 	test.Lock()
 	defer test.Unlock()
 
-	browsers := Browsers{Browsers: []Browser{
-		{Name: "browser", DefaultVersion: "1.0", Versions: []Version{
-			{Number: "1.0", Regions: []Region{
-				{Hosts: Hosts{
+	browsers := config.Browsers{Browsers: []config.Browser{
+		{Name: "browser", DefaultVersion: "1.0", Versions: []config.Version{
+			{Number: "1.0", Regions: []config.Region{
+				{Hosts: config.Hosts{
 					node,
 				}},
 			}},
@@ -1281,15 +1284,15 @@ func TestStartSessionJSONWireProtocol(t *testing.T) {
 	defer selenium.Close()
 
 	host, port := hostportnum(selenium.URL)
-	node := Host{Name: host, Port: port, Count: 1}
+	node := config.Host{Name: host, Port: port, Count: 1}
 
 	test.Lock()
 	defer test.Unlock()
 
-	browsers := Browsers{Browsers: []Browser{
-		{Name: "{browser}", DefaultVersion: "1.0", Versions: []Version{
-			{Number: "1.0", Regions: []Region{
-				{Hosts: Hosts{
+	browsers := config.Browsers{Browsers: []config.Browser{
+		{Name: "{browser}", DefaultVersion: "1.0", Versions: []config.Version{
+			{Number: "1.0", Regions: []config.Region{
+				{Hosts: config.Hosts{
 					node,
 				}},
 			}},
@@ -1314,15 +1317,15 @@ func TestPanicRouteProtocolError(t *testing.T) {
 	defer selenium.Close()
 
 	host, port := hostportnum(selenium.URL)
-	node := Host{Name: host, Port: port, Count: 1}
+	node := config.Host{Name: host, Port: port, Count: 1}
 
 	test.Lock()
 	defer test.Unlock()
 
-	browsers := Browsers{Browsers: []Browser{
-		{Name: "browser", DefaultVersion: "1.0", Versions: []Version{
-			{Number: "1.0", Regions: []Region{
-				{Hosts: Hosts{
+	browsers := config.Browsers{Browsers: []config.Browser{
+		{Name: "browser", DefaultVersion: "1.0", Versions: []config.Version{
+			{Number: "1.0", Regions: []config.Region{
+				{Hosts: config.Hosts{
 					node,
 				}},
 			}},
@@ -1343,15 +1346,15 @@ func TestDeleteSession(t *testing.T) {
 	defer selenium.Close()
 
 	host, port := hostportnum(selenium.URL)
-	node := Host{Name: host, Port: port, Count: 1}
+	node := config.Host{Name: host, Port: port, Count: 1}
 
 	test.Lock()
 	defer test.Unlock()
 
-	browsers := Browsers{Browsers: []Browser{
-		{Name: "browser", DefaultVersion: "1.0", Versions: []Version{
-			{Number: "1.0", Regions: []Region{
-				{Hosts: Hosts{
+	browsers := config.Browsers{Browsers: []config.Browser{
+		{Name: "browser", DefaultVersion: "1.0", Versions: []config.Version{
+			{Number: "1.0", Regions: []config.Region{
+				{Hosts: config.Hosts{
 					node,
 				}},
 			}},
@@ -1375,15 +1378,15 @@ func TestProxyRequest(t *testing.T) {
 	defer selenium.Close()
 
 	host, port := hostportnum(selenium.URL)
-	node := Host{Name: host, Port: port, Count: 1}
+	node := config.Host{Name: host, Port: port, Count: 1}
 
 	test.Lock()
 	defer test.Unlock()
 
-	browsers := Browsers{Browsers: []Browser{
-		{Name: "browser", DefaultVersion: "1.0", Versions: []Version{
-			{Number: "1.0", Regions: []Region{
-				{Hosts: Hosts{
+	browsers := config.Browsers{Browsers: []config.Browser{
+		{Name: "browser", DefaultVersion: "1.0", Versions: []config.Version{
+			{Number: "1.0", Regions: []config.Region{
+				{Hosts: config.Hosts{
 					node,
 				}},
 			}},
@@ -1410,15 +1413,15 @@ func TestProxyJsonRequest(t *testing.T) {
 	defer selenium.Close()
 
 	host, port := hostportnum(selenium.URL)
-	node := Host{Name: host, Port: port, Count: 1}
+	node := config.Host{Name: host, Port: port, Count: 1}
 
 	test.Lock()
 	defer test.Unlock()
 
-	browsers := Browsers{Browsers: []Browser{
-		{Name: "browser", DefaultVersion: "1.0", Versions: []Version{
-			{Number: "1.0", Regions: []Region{
-				{Hosts: Hosts{
+	browsers := config.Browsers{Browsers: []config.Browser{
+		{Name: "browser", DefaultVersion: "1.0", Versions: []config.Version{
+			{Number: "1.0", Regions: []config.Region{
+				{Hosts: config.Hosts{
 					node,
 				}},
 			}},
@@ -1443,15 +1446,15 @@ func TestProxyPlainRequest(t *testing.T) {
 	defer selenium.Close()
 
 	host, port := hostportnum(selenium.URL)
-	node := Host{Name: host, Port: port, Count: 1}
+	node := config.Host{Name: host, Port: port, Count: 1}
 
 	test.Lock()
 	defer test.Unlock()
 
-	browsers := Browsers{Browsers: []Browser{
-		{Name: "browser", DefaultVersion: "1.0", Versions: []Version{
-			{Number: "1.0", Regions: []Region{
-				{Hosts: Hosts{
+	browsers := config.Browsers{Browsers: []config.Browser{
+		{Name: "browser", DefaultVersion: "1.0", Versions: []config.Version{
+			{Number: "1.0", Regions: []config.Region{
+				{Hosts: config.Hosts{
 					node,
 				}},
 			}},
@@ -1468,15 +1471,15 @@ func TestProxyHttpsHost(t *testing.T) {
 	defer selenium.Close()
 
 	host, port := hostportnum(selenium.URL)
-	node := Host{Name: host, Port: port, Count: 1, Scheme: "https"}
+	node := config.Host{Name: host, Port: port, Count: 1, Scheme: "https"}
 
 	test.Lock()
 	defer test.Unlock()
 
-	browsers := Browsers{Browsers: []Browser{
-		{Name: "browser", DefaultVersion: "1.0", Versions: []Version{
-			{Number: "1.0", Regions: []Region{
-				{Hosts: Hosts{
+	browsers := config.Browsers{Browsers: []config.Browser{
+		{Name: "browser", DefaultVersion: "1.0", Versions: []config.Version{
+			{Number: "1.0", Regions: []config.Region{
+				{Hosts: config.Hosts{
 					node,
 				}},
 			}},
@@ -1555,15 +1558,15 @@ func TestStartSessionProxyHeaders(t *testing.T) {
 	defer selenium.Close()
 
 	host, port := hostportnum(selenium.URL)
-	node := Host{Name: host, Port: port, Count: 1}
+	node := config.Host{Name: host, Port: port, Count: 1}
 
 	test.Lock()
 	defer test.Unlock()
 
-	browsers := Browsers{Browsers: []Browser{
-		{Name: "browser", DefaultVersion: "1.0", Versions: []Version{
-			{Number: "1.0", Regions: []Region{
-				{Hosts: Hosts{
+	browsers := config.Browsers{Browsers: []config.Browser{
+		{Name: "browser", DefaultVersion: "1.0", Versions: []config.Version{
+			{Number: "1.0", Regions: []config.Region{
+				{Hosts: config.Hosts{
 					node,
 				}},
 			}},
@@ -1581,6 +1584,7 @@ func TestStartSessionProxyHeaders(t *testing.T) {
 
 func TestStartSessionGuest(t *testing.T) {
 	guestAccessAllowed = true
+	defer func() { guestAccessAllowed = false }()
 
 	dummyMux := http.NewServeMux()
 	dummyMux.HandleFunc("/wd/hub/session", postOnly(func(w http.ResponseWriter, r *http.Request) {
@@ -1590,15 +1594,15 @@ func TestStartSessionGuest(t *testing.T) {
 	defer selenium.Close()
 
 	host, port := hostportnum(selenium.URL)
-	node := Host{Name: host, Port: port, Count: 1}
+	node := config.Host{Name: host, Port: port, Count: 1}
 
 	test.Lock()
 	defer test.Unlock()
 
-	browsers := Browsers{Browsers: []Browser{
-		{Name: "{browser}", DefaultVersion: "1.0", Versions: []Version{
-			{Number: "1.0", Regions: []Region{
-				{Hosts: Hosts{
+	browsers := config.Browsers{Browsers: []config.Browser{
+		{Name: "{browser}", DefaultVersion: "1.0", Versions: []config.Version{
+			{Number: "1.0", Regions: []config.Region{
+				{Hosts: config.Hosts{
 					node,
 				}},
 			}},
@@ -1615,6 +1619,7 @@ func TestStartSessionGuest(t *testing.T) {
 
 func TestStartSessionGuestFailNoQuota(t *testing.T) {
 	guestAccessAllowed = true
+	defer func() { guestAccessAllowed = false }()
 
 	dummyMux := http.NewServeMux()
 	dummyMux.HandleFunc("/wd/hub/session", postOnly(func(w http.ResponseWriter, r *http.Request) {
@@ -1635,17 +1640,18 @@ func TestStartSessionGuestFailNoQuota(t *testing.T) {
 
 func TestStartSessionGuestAndCorrectBasicAuth(t *testing.T) {
 	guestAccessAllowed = true
+	defer func() { guestAccessAllowed = false }()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/wd/hub/session", postOnly(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`{"sessionId":"123"}`))
 	}))
 
-	browsersProvider := func(node Host) Browsers {
-		return Browsers{Browsers: []Browser{
-			{Name: "browser", DefaultVersion: "1.0", Versions: []Version{
-				{Number: "1.0", Regions: []Region{
-					{Hosts: Hosts{
+	browsersProvider := func(node config.Host) config.Browsers {
+		return config.Browsers{Browsers: []config.Browser{
+			{Name: "browser", DefaultVersion: "1.0", Versions: []config.Version{
+				{Number: "1.0", Regions: []config.Region{
+					{Hosts: config.Hosts{
 						node,
 					}},
 				}},
@@ -1657,6 +1663,7 @@ func TestStartSessionGuestAndCorrectBasicAuth(t *testing.T) {
 
 func TestStartSessionGuestModeAndWrongBasicAuth(t *testing.T) {
 	guestAccessAllowed = true
+	defer func() { guestAccessAllowed = false }()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/wd/hub/session", postOnly(func(w http.ResponseWriter, r *http.Request) {
@@ -1667,15 +1674,15 @@ func TestStartSessionGuestModeAndWrongBasicAuth(t *testing.T) {
 	defer selenium.Close()
 
 	host, port := hostportnum(selenium.URL)
-	node := Host{Name: host, Port: port, Count: 1}
+	node := config.Host{Name: host, Port: port, Count: 1}
 
 	test.Lock()
 	defer test.Unlock()
 
-	browsers := Browsers{Browsers: []Browser{
-		{Name: "browser", DefaultVersion: "1.0", Versions: []Version{
-			{Number: "1.0", Regions: []Region{
-				{Hosts: Hosts{
+	browsers := config.Browsers{Browsers: []config.Browser{
+		{Name: "browser", DefaultVersion: "1.0", Versions: []config.Version{
+			{Number: "1.0", Regions: []config.Region{
+				{Hosts: config.Hosts{
 					node,
 				}},
 			}},
@@ -1714,6 +1721,7 @@ func TestFileExists(t *testing.T) {
 
 func TestPanicGuestQuotaMissingUsersFileAuthPresent(t *testing.T) {
 	guestAccessAllowed = true
+	defer func() { guestAccessAllowed = false }()
 	users = "missing-file"
 	defer func() {
 		users = ".htpasswd"

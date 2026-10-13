@@ -4,9 +4,10 @@ import (
 	"fmt"
 	assert "github.com/stretchr/testify/require"
 	"os"
+	"path/filepath"
 	"testing"
 
-	. "github.com/aerokube/ggr/config"
+	"github.com/aerokube/ggr/config"
 )
 
 func init() {
@@ -14,77 +15,77 @@ func init() {
 }
 
 func TestEmptyListOfHosts(t *testing.T) {
-	host, index := choose(Hosts{})
+	host, index := choose(config.Hosts{})
 	assert.Nil(t, host)
 	assert.Equal(t, index, -1)
 }
 
 func TestNothingToChoose(t *testing.T) {
-	host, index := choose(Hosts{Host{Count: 0}, Host{Count: 0}})
+	host, index := choose(config.Hosts{config.Host{Count: 0}, config.Host{Count: 0}})
 	assert.Nil(t, host)
 	assert.Equal(t, index, -1)
 }
 
 func TestChooseFirst(t *testing.T) {
-	host, index := choose(Hosts{Host{Name: "first", Count: 1}, Host{Name: "mid", Count: 0}, Host{Name: "last", Count: 0}})
+	host, index := choose(config.Hosts{config.Host{Name: "first", Count: 1}, config.Host{Name: "mid", Count: 0}, config.Host{Name: "last", Count: 0}})
 	assert.Equal(t, host.Name, "first")
 	assert.Equal(t, index, 0)
 }
 
 func TestChooseMid(t *testing.T) {
-	host, index := choose(Hosts{Host{Name: "first", Count: 0}, Host{Name: "mid", Count: 1}, Host{Name: "last", Count: 0}})
+	host, index := choose(config.Hosts{config.Host{Name: "first", Count: 0}, config.Host{Name: "mid", Count: 1}, config.Host{Name: "last", Count: 0}})
 	assert.Equal(t, host.Name, "mid")
 	assert.Equal(t, index, 1)
 }
 
 func TestChooseLast(t *testing.T) {
-	host, index := choose(Hosts{Host{Name: "first", Count: 0}, Host{Name: "mid", Count: 0}, Host{Name: "last", Count: 1}})
+	host, index := choose(config.Hosts{config.Host{Name: "first", Count: 0}, config.Host{Name: "mid", Count: 0}, config.Host{Name: "last", Count: 1}})
 	assert.Equal(t, host.Name, "last")
 	assert.Equal(t, index, 2)
 }
 
 var (
-	browsersWithMultipleVersions = &ggrBrowsers{Browsers{Browsers: []Browser{
-		{Name: "browser", DefaultVersion: "2.0", Versions: []Version{
-			{Number: "2.0", Regions: []Region{
-				{Hosts: Hosts{
-					Host{Name: "browser-2.0"},
+	browsersWithMultipleVersions = &ggrBrowsers{config.Browsers{Browsers: []config.Browser{
+		{Name: "browser", DefaultVersion: "2.0", Versions: []config.Version{
+			{Number: "2.0", Regions: []config.Region{
+				{Hosts: config.Hosts{
+					config.Host{Name: "browser-2.0"},
 				}},
 			}},
-			{Number: "1.0", Regions: []Region{
-				{Hosts: Hosts{
-					Host{Name: "browser-1.0"},
+			{Number: "1.0", Regions: []config.Region{
+				{Hosts: config.Hosts{
+					config.Host{Name: "browser-1.0"},
 				}},
 			}},
-			{Number: "", Regions: []Region{
-				{Hosts: Hosts{
-					Host{Name: "browser"},
-				}},
-			}},
-		}}}}}
-
-	browsersWithMultipleRegions = &ggrBrowsers{Browsers{Browsers: []Browser{
-		{Name: "browser", DefaultVersion: "1.0", Versions: []Version{
-			{Number: "1.0", Regions: []Region{
-				{Name: "e", Hosts: Hosts{
-					Host{Name: "browser-e-1.0", Port: 4444},
-				}},
-				{Name: "f", Hosts: Hosts{
-					Host{Name: "browser-f-1.0", Port: 4444},
+			{Number: "", Regions: []config.Region{
+				{Hosts: config.Hosts{
+					config.Host{Name: "browser"},
 				}},
 			}},
 		}}}}}
 
-	browsersWithMultiplePlatforms = &ggrBrowsers{Browsers{Browsers: []Browser{
-		{Name: "browser", DefaultVersion: "2.0", DefaultPlatform: "LINUX", Versions: []Version{
-			{Number: "2.0", Platform: "LINUX", Regions: []Region{
-				{Hosts: Hosts{
-					Host{Name: "browser-2.0-linux"},
+	browsersWithMultipleRegions = &ggrBrowsers{config.Browsers{Browsers: []config.Browser{
+		{Name: "browser", DefaultVersion: "1.0", Versions: []config.Version{
+			{Number: "1.0", Regions: []config.Region{
+				{Name: "e", Hosts: config.Hosts{
+					config.Host{Name: "browser-e-1.0", Port: 4444},
+				}},
+				{Name: "f", Hosts: config.Hosts{
+					config.Host{Name: "browser-f-1.0", Port: 4444},
 				}},
 			}},
-			{Number: "2.0", Platform: "WINDOWS", Regions: []Region{
-				{Hosts: Hosts{
-					Host{Name: "browser-2.0-windows"},
+		}}}}}
+
+	browsersWithMultiplePlatforms = &ggrBrowsers{config.Browsers{Browsers: []config.Browser{
+		{Name: "browser", DefaultVersion: "2.0", DefaultPlatform: "LINUX", Versions: []config.Version{
+			{Number: "2.0", Platform: "LINUX", Regions: []config.Region{
+				{Hosts: config.Hosts{
+					config.Host{Name: "browser-2.0-linux"},
+				}},
+			}},
+			{Number: "2.0", Platform: "WINDOWS", Regions: []config.Region{
+				{Hosts: config.Hosts{
+					config.Host{Name: "browser-2.0-windows"},
 				}},
 			}},
 		}}}}}
@@ -181,7 +182,7 @@ func TestReadNotExistingConfig(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var browsers Browsers
+	var browsers config.Browsers
 	err = readConfig(tmp.Name(), &browsers)
 
 	assert.Error(t, err)
@@ -202,7 +203,7 @@ func TestParseInvalidConfig(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var browsers Browsers
+	var browsers config.Browsers
 	err = readConfig(tmp.Name(), &browsers)
 
 	assert.Error(t, err)
@@ -217,13 +218,13 @@ func TestParseConfigWithoutNamespace(t *testing.T) {
 	testParseConfig(t, `<browsers><browser name="browser"/></browsers>`)
 }
 
-func testParseConfig(t *testing.T, config string) {
+func testParseConfig(t *testing.T, xmlConfig string) {
 	tmp, err := os.CreateTemp("", "config")
 	defer os.Remove(tmp.Name())
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = tmp.Write([]byte(config))
+	_, err = tmp.Write([]byte(xmlConfig))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -231,7 +232,7 @@ func testParseConfig(t *testing.T, config string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var browsers Browsers
+	var browsers config.Browsers
 	err = readConfig(tmp.Name(), &browsers)
 
 	assert.NoError(t, err)
@@ -250,9 +251,50 @@ func TestConcurrentReload(t *testing.T) {
 	_ = loadQuotaFiles("quota")
 }
 
+func TestFindPrefixVersionDoesNotMixVersions(t *testing.T) {
+	browsers := &ggrBrowsers{config.Browsers{Browsers: []config.Browser{
+		{Name: "browser", Versions: []config.Version{
+			{Number: "10", Regions: []config.Region{{Hosts: config.Hosts{config.Host{Name: "browser-10"}}}}},
+			{Number: "100", Regions: []config.Region{{Hosts: config.Hosts{config.Host{Name: "browser-100"}}}}},
+		}}}}}
+	hosts, version, _ := browsers.find("browser", "1", "", newSet(), newSet())
+	assert.Equal(t, "10", version)
+	assert.Equal(t, config.Hosts{config.Host{Name: "browser-10"}}, hosts)
+}
+
+func TestReloadRemovesDeletedQuota(t *testing.T) {
+	test.Lock()
+	defer test.Unlock()
+	confLock.Lock()
+	saved := quota
+	quota = make(map[string]ggrBrowsers)
+	confLock.Unlock()
+	defer func() {
+		confLock.Lock()
+		quota = saved
+		confLock.Unlock()
+	}()
+
+	dir := t.TempDir()
+	xml := `<qa:browsers xmlns:qa="urn:config.gridrouter.qatools.ru"><browser name="browser"/></qa:browsers>`
+	for _, name := range []string{"alice.xml", "bob.xml"} {
+		assert.NoError(t, os.WriteFile(filepath.Join(dir, name), []byte(xml), 0o644))
+	}
+	assert.NoError(t, loadQuotaFiles(dir))
+	assert.NoError(t, os.Remove(filepath.Join(dir, "bob.xml")))
+	assert.NoError(t, loadQuotaFiles(dir))
+
+	confLock.RLock()
+	defer confLock.RUnlock()
+	_, alice := quota["alice"]
+	_, bob := quota["bob"]
+	assert.True(t, alice)
+	assert.False(t, bob, "quota of a deleted file must be removed on reload")
+}
+
 func TestChoosingAllHosts(t *testing.T) {
 	//NOTE: the same weights for all hosts are important!
-	hosts := Hosts{Host{Name: "first", Count: 1}, Host{Name: "mid", Count: 1}, Host{Name: "last", Count: 1}}
+	hosts := config.Hosts{config.Host{Name: "first", Count: 1}, config.Host{Name: "mid", Count: 1}, config.Host{Name: "last", Count: 1}}
 	chosenHosts := make(map[string]int)
 	for i := 0; i < 100; i++ {
 		host, _ := choose(hosts)

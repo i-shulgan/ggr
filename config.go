@@ -1,7 +1,7 @@
 package main
 
 import (
-	. "github.com/aerokube/ggr/config"
+	"github.com/aerokube/ggr/config"
 	"math/rand"
 	"strings"
 )
@@ -37,18 +37,18 @@ func (ss *setImpl) size() int {
 	return len(ss.data)
 }
 
-func sessionURL(h *Host) string {
+func sessionURL(h *config.Host) string {
 	return h.Route() + paths.Route
 }
 
 type ggrBrowsers struct {
-	Browsers
+	config.Browsers
 }
 
 const anyPlatform = "ANY"
 
-func (b *ggrBrowsers) find(browser, version string, platform string, excludedHosts set, excludedRegions set) (Hosts, string, set) {
-	var hosts Hosts
+func (b *ggrBrowsers) find(browser, version string, platform string, excludedHosts set, excludedRegions set) (config.Hosts, string, set) {
+	var hosts config.Hosts
 	for _, b := range b.Browsers.Browsers {
 		if b.Name == browser {
 			if version == "" {
@@ -57,8 +57,17 @@ func (b *ggrBrowsers) find(browser, version string, platform string, excludedHos
 			if platform == "" || platform == anyPlatform {
 				platform = b.DefaultPlatform
 			}
+			matched := false
 			for _, v := range b.Versions {
-				if strings.HasPrefix(v.Number, version) && (v.Platform == "" || strings.HasPrefix(strings.ToLower(v.Platform), strings.ToLower(platform))) {
+				// Once a prefix matched, version holds the full number and only
+				// exactly equal entries may add hosts: "1" must not match both
+				// "10" and "100" while sending "100" to hosts of "10".
+				versionMatches := strings.HasPrefix(v.Number, version)
+				if matched {
+					versionMatches = v.Number == version
+				}
+				if versionMatches && (v.Platform == "" || strings.HasPrefix(strings.ToLower(v.Platform), strings.ToLower(platform))) {
+					matched = true
 					version = v.Number
 				next:
 					for _, r := range v.Regions {
@@ -81,7 +90,7 @@ func (b *ggrBrowsers) find(browser, version string, platform string, excludedHos
 	return hosts, version, excludedRegions
 }
 
-func choose(hosts Hosts) (*Host, int) {
+func choose(hosts config.Hosts) (*config.Host, int) {
 	total := 0
 	for _, h := range hosts {
 		total += h.Count
