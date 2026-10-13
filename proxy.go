@@ -468,7 +468,7 @@ func (s *newSession) round(w http.ResponseWriter, r *http.Request) roundResult {
 	hosts, excludedRegions, unavailable := s.candidates(excludedHosts, newSet())
 	busy := unavailable
 	for len(hosts) > 0 {
-		h, i := choose(hosts)
+		h, i := pick(hosts)
 		if h == nil {
 			break
 		}
@@ -491,6 +491,7 @@ func (s *newSession) round(w http.ResponseWriter, r *http.Request) roundResult {
 		s.log("SESSION_ATTEMPTED", host, "", true, "")
 		s.caps.setVersion(s.version)
 		metricAttempts.WithLabelValues(host).Inc()
+		noteAttempt(host)
 		resp, status := session(r.Context(), h, r.Header, s.caps)
 		if r.Context().Err() != nil {
 			breakerRelease(host)

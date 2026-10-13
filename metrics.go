@@ -59,4 +59,9 @@ var (
 		Help:    "Time new session requests spent in the queue, by result.",
 		Buckets: []float64{0.5, 1, 2.5, 5, 10, 30, 60, 120, 300, 600},
 	}, []string{"result"})
+
+	metricFreeSlots = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "ggr_host_free_slots",
+		Help: "Free slots of a host from its last /status (total - used - pending).",
+	}, []string{"host"})
 )

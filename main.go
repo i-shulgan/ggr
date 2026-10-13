@@ -125,6 +125,7 @@ func parseFlags() {
 	flag.IntVar(&maxQueue, "max-queue", maxQueue, "maximum number of new session requests waiting for a free host, others get 503 (0 - unlimited)")
 	flag.DurationVar(&queueBackoff, "queue-backoff", queueBackoff, "initial delay between passes over busy hosts, doubled up to -queue-backoff-max")
 	flag.DurationVar(&queueBackoffMax, "queue-backoff-max", queueBackoffMax, "maximum delay between passes over busy hosts")
+	flag.DurationVar(&statusInterval, "status-interval", statusInterval, "poll /status of hosts this often and prefer hosts with free slots (0 - disabled, weighted random by count)")
 	flag.IntVar(&maxStartFailures, "max-start-failures", maxStartFailures, "give up a new session request after this many browser start errors on different hosts (0 - try every host)")
 	flag.DurationVar(&breakerTimeout, "breaker-timeout", breakerTimeout, "do not send new sessions to a host for this long after it stopped answering (0 - disabled, skip it for the current request only)")
 	flag.IntVar(&breakerThreshold, "breaker-threshold", breakerThreshold, "consecutive connection errors that open the circuit breaker of a host")
@@ -149,6 +150,7 @@ func configure() {
 			}
 		}
 	}()
+	startStatusPoller(context.Background())
 	for _, hook := range startHooks {
 		hook()
 	}
