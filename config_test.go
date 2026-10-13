@@ -251,6 +251,17 @@ func TestConcurrentReload(t *testing.T) {
 	_ = loadQuotaFiles("quota")
 }
 
+func TestFindPrefixVersionDoesNotMixVersions(t *testing.T) {
+	browsers := &ggrBrowsers{config.Browsers{Browsers: []config.Browser{
+		{Name: "browser", Versions: []config.Version{
+			{Number: "10", Regions: []config.Region{{Hosts: config.Hosts{config.Host{Name: "browser-10"}}}}},
+			{Number: "100", Regions: []config.Region{{Hosts: config.Hosts{config.Host{Name: "browser-100"}}}}},
+		}}}}}
+	hosts, version, _ := browsers.find("browser", "1", "", newSet(), newSet())
+	assert.Equal(t, "10", version)
+	assert.Equal(t, config.Hosts{config.Host{Name: "browser-10"}}, hosts)
+}
+
 func TestReloadRemovesDeletedQuota(t *testing.T) {
 	test.Lock()
 	defer test.Unlock()

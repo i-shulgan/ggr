@@ -57,8 +57,17 @@ func (b *ggrBrowsers) find(browser, version string, platform string, excludedHos
 			if platform == "" || platform == anyPlatform {
 				platform = b.DefaultPlatform
 			}
+			matched := false
 			for _, v := range b.Versions {
-				if strings.HasPrefix(v.Number, version) && (v.Platform == "" || strings.HasPrefix(strings.ToLower(v.Platform), strings.ToLower(platform))) {
+				// Once a prefix matched, version holds the full number and only
+				// exactly equal entries may add hosts: "1" must not match both
+				// "10" and "100" while sending "100" to hosts of "10".
+				versionMatches := strings.HasPrefix(v.Number, version)
+				if matched {
+					versionMatches = v.Number == version
+				}
+				if versionMatches && (v.Platform == "" || strings.HasPrefix(strings.ToLower(v.Platform), strings.ToLower(platform))) {
+					matched = true
 					version = v.Number
 				next:
 					for _, r := range v.Regions {
