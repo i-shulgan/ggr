@@ -48,15 +48,37 @@ func loadQuotaFiles(quotaDir string) error {
 		return fmt.Errorf("no quota XML files found in [%s] - exiting", quotaDir)
 	}
 
+	present := make(map[string]struct{}, len(files))
 	for _, file := range files {
+		present[quotaName(file)] = struct{}{}
 		loadQuotaFile(file)
 	}
+	removeMissingQuota(present)
 	return nil
+}
+
+func quotaName(file string) string {
+	fileName := filepath.Base(file)
+	return strings.TrimSuffix(fileName, filepath.Ext(fileName))
+}
+
+// removeMissingQuota drops users whose quota files were deleted. Routes are
+// kept so that sessions already running on their hosts keep working.
+func removeMissingQuota(present map[string]struct{}) {
+	confLock.Lock()
+	defer confLock.Unlock()
+	for name := range quota {
+		if _, ok := present[name]; !ok {
+			delete(quota, name)
+			lastReloadTime = time.Now()
+			log.Printf("[-] [-] [INIT] [-] [-] [-] [-] [-] [-] [Removed quota \"%s\": file no longer exists]\n", name)
+		}
+	}
 }
 
 func loadQuotaFile(file string) {
 	fileName := filepath.Base(file)
-	quotaName := strings.TrimSuffix(fileName, filepath.Ext(fileName))
+	quotaName := quotaName(file)
 	var browsers config.Browsers
 	err := readConfig(file, &browsers)
 	if err != nil {

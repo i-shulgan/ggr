@@ -4,6 +4,7 @@ import (
 	"fmt"
 	assert "github.com/stretchr/testify/require"
 	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/aerokube/ggr/config"
@@ -248,6 +249,36 @@ func TestConcurrentReload(t *testing.T) {
 		_ = loadQuotaFiles("quota")
 	}()
 	_ = loadQuotaFiles("quota")
+}
+
+func TestReloadRemovesDeletedQuota(t *testing.T) {
+	test.Lock()
+	defer test.Unlock()
+	confLock.Lock()
+	saved := quota
+	quota = make(map[string]ggrBrowsers)
+	confLock.Unlock()
+	defer func() {
+		confLock.Lock()
+		quota = saved
+		confLock.Unlock()
+	}()
+
+	dir := t.TempDir()
+	xml := `<qa:browsers xmlns:qa="urn:config.gridrouter.qatools.ru"><browser name="browser"/></qa:browsers>`
+	for _, name := range []string{"alice.xml", "bob.xml"} {
+		assert.NoError(t, os.WriteFile(filepath.Join(dir, name), []byte(xml), 0o644))
+	}
+	assert.NoError(t, loadQuotaFiles(dir))
+	assert.NoError(t, os.Remove(filepath.Join(dir, "bob.xml")))
+	assert.NoError(t, loadQuotaFiles(dir))
+
+	confLock.RLock()
+	defer confLock.RUnlock()
+	_, alice := quota["alice"]
+	_, bob := quota["bob"]
+	assert.True(t, alice)
+	assert.False(t, bob, "quota of a deleted file must be removed on reload")
 }
 
 func TestChoosingAllHosts(t *testing.T) {
